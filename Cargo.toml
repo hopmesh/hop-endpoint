@@ -1,0 +1,14 @@
+[package]
+name = "hop-endpoint"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "hops:// origin endpoint — a listening Hop node that translates hops requests to its OWN HTTP backend (DESIGN.md §30). Operator-run; bound to one domain; never an open proxy."
+
+[dependencies]
+hop-core.workspace = true
+# rustls feature so the endpoint can DIAL a relay over wss:// (be routable on the mesh, §30).
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+bs58 = "0.5"
