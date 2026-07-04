@@ -25,8 +25,10 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +36,48 @@ use hop_core::prelude::*;
 use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
+
+/// F-19: cap on concurrent inbound connections, so the one-thread-per-connection accept loop can't
+/// exhaust threads/memory on the single always-on instance. Generous for legitimate traffic.
+const MAX_CONNS: usize = 256;
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements the active-connection count when a connection handler thread finishes (including on a
+/// panic unwind, since it runs in Drop). Paired with the `fetch_add` in the accept loop.
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// F-19: per-source fixed-window rate limit. One noisy client can otherwise monopolize the
+/// connection cap and the single instance; this bounds requests per source IP per window.
+const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_REQ_PER_WINDOW: u32 = 100;
+/// Above this many tracked sources we sweep expired windows so the map can't grow without bound.
+const RATE_MAP_SWEEP_AT: usize = 10_000;
+
+fn rate_state() -> &'static Mutex<HashMap<IpAddr, (Instant, u32)>> {
+    static RATE: OnceLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> = OnceLock::new();
+    RATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True if `ip` is under its per-window budget (and records this request). False ⇒ shed it.
+fn allow_source(ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let mut map = rate_state().lock().unwrap();
+    if map.len() > RATE_MAP_SWEEP_AT {
+        map.retain(|_, (start, _)| now.duration_since(*start) < RATE_WINDOW);
+    }
+    let (start, count) = map.entry(ip).or_insert((now, 0));
+    if now.duration_since(*start) >= RATE_WINDOW {
+        *start = now;
+        *count = 0;
+    }
+    *count += 1;
+    *count <= MAX_REQ_PER_WINDOW
+}
 
 /// Driver events: bearer lifecycle + a completed backend fetch handed back from a worker.
 enum Ev {
@@ -131,8 +175,30 @@ fn main() {
         let origin = origin.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                // F-19: bound concurrent connections so the one-thread-per-connection accept loop
+                // can't be driven to thread/memory exhaustion on the single 512Mi instance. Over the
+                // cap we shed load (drop the socket) rather than spawn unboundedly.
+                // F-19: shed a source that's over its per-window budget before spending a slot.
+                if let Ok(peer) = stream.peer_addr() {
+                    if !allow_source(peer.ip()) {
+                        drop(stream);
+                        continue;
+                    }
+                }
+                if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+                    ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
                 let (tx, origin, http) = (tx.clone(), origin.clone(), http_accept.clone());
-                std::thread::spawn(move || serve_conn(stream, &tx, &origin, &http, max_resp));
+                std::thread::spawn(move || {
+                    let _guard = ConnGuard; // decrements ACTIVE_CONNS on drop (incl. panic unwind)
+                    // F-19: isolate a per-connection panic so a malformed request can't tear down
+                    // the accept loop / process (the driver still runs on the main thread).
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        serve_conn(stream, &tx, &origin, &http, max_resp)
+                    }));
+                });
             }
         });
     }
