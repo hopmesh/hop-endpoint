@@ -27,9 +27,9 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hop_core::prelude::*;
@@ -89,7 +89,10 @@ enum Ev {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn main() {
@@ -125,11 +128,15 @@ fn main() {
         return;
     }
     let origin = origin.unwrap_or_else(|| {
-        eprintln!("--origin http://your-backend is required (the ONLY backend this endpoint serves)");
+        eprintln!(
+            "--origin http://your-backend is required (the ONLY backend this endpoint serves)"
+        );
         std::process::exit(2);
     });
     let domain = domain.unwrap_or_else(|| {
-        eprintln!("--domain example.com is required (the ONLY hops:// host this endpoint answers for)");
+        eprintln!(
+            "--domain example.com is required (the ONLY hops:// host this endpoint answers for)"
+        );
         std::process::exit(2);
     });
     // Bind to a single origin: scheme://host[:port], no trailing slash. Requests only ever
@@ -151,8 +158,13 @@ fn main() {
     println!("hop-endpoint: address {}", bs58::encode(addr).into_string());
     println!("hop-endpoint: authorized domain {domain}  (rejects any other host)");
     println!("hop-endpoint: serving origin {origin}");
-    println!("hop-endpoint: publish DNS →  _hopaddress.{domain}  TXT  \"{}\"", bs58::encode(addr).into_string());
-    println!("hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin)");
+    println!(
+        "hop-endpoint: publish DNS →  _hopaddress.{domain}  TXT  \"{}\"",
+        bs58::encode(addr).into_string()
+    );
+    println!(
+        "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin)"
+    );
 
     // Redirects are disabled: the backend can never bounce us to a different host.
     let http = reqwest::blocking::Client::builder()
@@ -193,8 +205,8 @@ fn main() {
                 let (tx, origin, http) = (tx.clone(), origin.clone(), http_accept.clone());
                 std::thread::spawn(move || {
                     let _guard = ConnGuard; // decrements ACTIVE_CONNS on drop (incl. panic unwind)
-                    // F-19: isolate a per-connection panic so a malformed request can't tear down
-                    // the accept loop / process (the driver still runs on the main thread).
+                                            // F-19: isolate a per-connection panic so a malformed request can't tear down
+                                            // the accept loop / process (the driver still runs on the main thread).
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         serve_conn(stream, &tx, &origin, &http, max_resp)
                     }));
@@ -268,7 +280,8 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                                 eprintln!("hop-endpoint: sent handshake to relay");
                             }
                         }
-                        Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(tungstenite::Error::Io(e))
+                            if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => break,
                     }
                     match ws.read() {
@@ -340,7 +353,10 @@ fn run(
             // BEFORE spawning a fetch. The signed `host` must equal our single --domain.
             let req_host = r.host.trim_end_matches('.').to_ascii_lowercase();
             if req_host != domain {
-                eprintln!("hop-endpoint: refusing host {:?} (authorized: {domain})", r.host);
+                eprintln!(
+                    "hop-endpoint: refusing host {:?} (authorized: {domain})",
+                    r.host
+                );
                 let body = format!("hop-endpoint: this endpoint only serves {domain}").into_bytes();
                 let ct = "text/plain; charset=utf-8".to_string();
                 let _ = tx.send(Ev::Fetched(r.from, r.id, 403, ct, body));
@@ -404,7 +420,11 @@ fn path_of(url: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .or_else(|| url.strip_prefix("hops://"))
-        .map(|rest| rest.split_once('/').map(|(_, p)| format!("/{p}")).unwrap_or_else(|| "/".to_string()))
+        .map(|rest| {
+            rest.split_once('/')
+                .map(|(_, p)| format!("/{p}"))
+                .unwrap_or_else(|| "/".to_string())
+        })
         .unwrap_or_else(|| url.to_string());
     if after.starts_with('/') {
         after
@@ -450,7 +470,11 @@ fn serve_http_proxy(
 
     let head_only = method.eq_ignore_ascii_case("HEAD");
     let (status, ctype, body) = if !method.eq_ignore_ascii_case("GET") && !head_only {
-        (405u16, "text/plain; charset=utf-8".to_string(), b"hop-endpoint: only GET/HEAD over plain HTTP".to_vec())
+        (
+            405u16,
+            "text/plain; charset=utf-8".to_string(),
+            b"hop-endpoint: only GET/HEAD over plain HTTP".to_vec(),
+        )
     } else {
         let url = format!("{origin}{}", path_of(&raw_path));
         // The LB terminated TLS for us; tell the origin this came over standard https.
@@ -469,7 +493,11 @@ fn serve_http_proxy(
                 }
                 (status, ctype, body)
             }
-            Err(_) => (502, "text/plain; charset=utf-8".to_string(), b"hop-endpoint: backend unreachable".to_vec()),
+            Err(_) => (
+                502,
+                "text/plain; charset=utf-8".to_string(),
+                b"hop-endpoint: backend unreachable".to_vec(),
+            ),
         }
     };
 
@@ -516,7 +544,9 @@ fn serve_conn(
         Ok(w) => w,
         Err(_) => return,
     };
-    let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = ws
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)));
 
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
@@ -566,7 +596,9 @@ fn load_identity(path: &Option<String>) -> Identity {
         }
         let id = Identity::generate();
         if std::fs::write(path, id.to_secret_bytes()).is_err() {
-            eprintln!("warning: could not persist identity to {path}; address will change on restart");
+            eprintln!(
+                "warning: could not persist identity to {path}; address will change on restart"
+            );
         }
         return id;
     }
