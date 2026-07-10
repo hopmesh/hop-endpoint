@@ -119,6 +119,8 @@ fn main() {
     // Dial a relay so the endpoint is reachable by its address on the mesh (can send/receive
     // messages), as a leaf that never carries others' traffic (DESIGN.md §30). Default on.
     let mut relay: Option<String> = Some("wss://relay.hopme.sh/".to_string());
+    // services-11: whether a --relay/--no-relay was given on the CLI, so env only fills the default.
+    let mut relay_cli_set = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -127,13 +129,39 @@ fn main() {
             "--domain" => domain = args.next(),
             "--identity-file" => identity_file = args.next(),
             "--max-resp" => max_resp = args.next().and_then(|s| s.parse().ok()).unwrap_or(max_resp),
-            "--relay" => relay = args.next(),
-            "--no-relay" => relay = None, // run isolated (listening only), e.g. for local tests
+            "--relay" => {
+                relay = args.next();
+                relay_cli_set = true;
+            }
+            "--no-relay" => {
+                relay = None; // run isolated (listening only), e.g. for local tests
+                relay_cli_set = true;
+            }
             // Load the identity, print its base58 address, and exit. Used to fill in the
             // `_hopaddress.<domain>` TXT record before the endpoint ever serves traffic.
             "--print-address" => print_address = true,
             other => eprintln!("ignoring unknown arg: {other}"),
         }
+    }
+
+    // services-11: graceful degrade when the relay fleet is off (relays_enabled=false). Infra can
+    // set HOP_NO_RELAY=1 (or HOP_RELAY to a specific URL) so the always-on example instance doesn't
+    // spin dialing a dead relay - it just serves its origin over plain HTTP. A CLI --relay/--no-relay
+    // still wins; env only fills the default so the container needs no arg change to degrade.
+    if !relay_cli_set {
+        match std::env::var("HOP_NO_RELAY").as_deref() {
+            Ok("1") | Ok("true") | Ok("yes") => relay = None,
+            _ => {
+                if let Ok(url) = std::env::var("HOP_RELAY") {
+                    if !url.is_empty() {
+                        relay = Some(url);
+                    }
+                }
+            }
+        }
+    }
+    if relay.is_none() {
+        println!("hop-endpoint: no relay configured; serving origin only (not mesh-routable)");
     }
 
     if print_address {
@@ -240,14 +268,40 @@ fn main() {
     run(node, domain, origin, http, max_resp, tx, rx);
 }
 
+/// services-11: reconnect backoff bounds. When the relay fleet is off (relays_enabled=false) the
+/// dead relay is unreachable indefinitely; a flat 5s retry then spams a reconnect attempt + log line
+/// every 5s forever, burning the always-on instance's CPU and filling logs. Back off exponentially
+/// from a short base up to a cap so a dead relay is probed rarely (once a minute), while a real relay
+/// blip still reconnects fast.
+const RECONNECT_BASE: Duration = Duration::from_secs(5);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+
+/// The backoff after `failures` consecutive failed dials: `BASE * 2^(failures-1)`, capped at MAX.
+/// `failures == 0` (a fresh success) resets to BASE. Pure + total so it is unit-testable (services-11).
+fn reconnect_backoff(failures: u32) -> Duration {
+    if failures == 0 {
+        return RECONNECT_BASE;
+    }
+    let base = RECONNECT_BASE.as_secs();
+    // Saturating shift: 2^(failures-1) without overflow, then cap at MAX.
+    let mult = 1u64.checked_shl(failures - 1).unwrap_or(u64::MAX);
+    let secs = base.saturating_mul(mult).min(RECONNECT_MAX.as_secs());
+    Duration::from_secs(secs)
+}
+
 /// Dial a relay over `wss://` and bridge it as a Hop bearer link (we're the Initiator), so
-/// this endpoint is reachable by its address through the mesh. Reconnects forever. Same
-/// read-timeout interleave as the inbound bearer, but as a TLS WebSocket client.
+/// this endpoint is reachable by its address through the mesh. Reconnects with exponential backoff
+/// (services-11) so a dead relay isn't hammered every 5s. Same read-timeout interleave as the
+/// inbound bearer, but as a TLS WebSocket client.
 fn dial_relay(url: String, ev_tx: Sender<Ev>) {
     use tungstenite::stream::MaybeTlsStream;
+    // services-11: consecutive-failure count drives the backoff; a successful connect resets it, so a
+    // real relay blip reconnects fast while a permanently-dead relay is probed at most once a minute.
+    let mut failures: u32 = 0;
     loop {
         match tungstenite::connect(&url) {
             Ok((mut ws, _resp)) => {
+                failures = 0; // connected: reset the backoff
                 eprintln!("hop-endpoint: connected to relay {url}");
                 // Non-blocking socket: a read MUST NOT block, or the loop never gets back to
                 // send our outgoing Noise handshake msg1 (it's produced by the driver right
@@ -316,10 +370,26 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                     }
                 }
                 let _ = ev_tx.send(Ev::Down(link));
+                // A clean disconnect after a good connection: treat the NEXT dial as a fresh attempt
+                // (failures already reset to 0 on connect), so a transient drop reconnects at BASE.
             }
-            Err(e) => eprintln!("hop-endpoint: relay {url} unreachable ({e}); retrying"),
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                let wait = reconnect_backoff(failures);
+                // services-11: report the degraded state and back off, instead of spamming a dial +
+                // log every 5s at a dead relay (e.g. while relays_enabled=false). The endpoint keeps
+                // serving its origin over plain HTTP the whole time; only mesh reachability is down.
+                eprintln!(
+                    "hop-endpoint: relay {url} unreachable ({e}); mesh-unreachable, \
+                     retry #{failures} in {}s",
+                    wait.as_secs()
+                );
+                std::thread::sleep(wait);
+                continue;
+            }
         }
-        std::thread::sleep(Duration::from_secs(5));
+        // A connection that came up and later dropped: brief pause, then reconnect promptly.
+        std::thread::sleep(RECONNECT_BASE);
     }
 }
 
@@ -737,6 +807,41 @@ mod tests {
         assert!(
             !allow_source(ip),
             "the request past the window budget is shed"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_then_caps() {
+        // services-11: a dead relay must not be dialed every 5s forever. Backoff starts at BASE,
+        // doubles per consecutive failure, and caps at MAX so a permanently-down relay is probed
+        // rarely (once a minute) rather than hammered.
+        assert_eq!(
+            reconnect_backoff(0),
+            RECONNECT_BASE,
+            "no failures resets to base"
+        );
+        assert_eq!(
+            reconnect_backoff(1),
+            Duration::from_secs(5),
+            "first failure = base"
+        );
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(10));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(20));
+        assert_eq!(reconnect_backoff(4), Duration::from_secs(40));
+        assert_eq!(
+            reconnect_backoff(5),
+            RECONNECT_MAX,
+            "caps at max (would be 80s)"
+        );
+        assert_eq!(
+            reconnect_backoff(100),
+            RECONNECT_MAX,
+            "stays capped, no overflow"
+        );
+        // The whole point: a dead relay is probed at most once per MAX, not every 5s.
+        assert!(
+            reconnect_backoff(20) <= RECONNECT_MAX,
+            "a long-dead relay is never dialed faster than the cap"
         );
     }
 
