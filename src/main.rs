@@ -24,7 +24,7 @@
 //! is no code path by which this process fetches anything other than `<origin><path>`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -64,6 +64,13 @@ impl Drop for FetchGuard {
         INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+/// services-r3-03: hard cap on the TOTAL bytes of a plain-HTTP request line plus all headers. The
+/// proxy reads these into growable `String`s with `read_line`; without a cap a hostile client can
+/// stream an endless request line / header block and grow the buffer until the 512Mi instance OOMs.
+/// 64 KiB is far above any legitimate request head (paths + a normal header set), so a real client
+/// is never truncated; anything past it is a resource-exhaustion attempt and the connection is shed.
+const MAX_REQ_HEAD_BYTES: u64 = 64 * 1024;
 
 /// F-19: per-source fixed-window rate limit. One noisy client can otherwise monopolize the
 /// connection cap and the single instance; this bounds requests per source IP per window.
@@ -481,33 +488,56 @@ fn run(
 ) {
     let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
     loop {
+        // services-r3-04: the accept threads wrap serve_conn in catch_unwind so one malformed request
+        // can't tear down the process, but the driver's own parse/handle ran unguarded on this thread.
+        // A core panic while parsing a malformed/hostile bundle (BearerEvent::Data) would then kill
+        // the whole endpoint. Mirror the accept path: run every node.* call that touches attacker-
+        // controlled bytes under catch_unwind, so a core panic becomes a logged skip, not process
+        // death. node is `&mut`, so AssertUnwindSafe (same as serve_conn's wrapper); on a caught
+        // panic the node keeps running and the next event is processed.
         match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(Ev::Up(link, role, out)) => {
                 writers.insert(link, out);
-                node.handle(BearerEvent::Connected(link, role));
+                guard_core("bearer-connected", || {
+                    node.handle(BearerEvent::Connected(link, role))
+                });
             }
-            Ok(Ev::Data(link, bytes)) => node.handle(BearerEvent::Data(link, bytes)),
+            Ok(Ev::Data(link, bytes)) => {
+                // The malformed-bundle path: bytes are attacker-controlled, so guard the parse/handle.
+                guard_core("bearer-data", || {
+                    node.handle(BearerEvent::Data(link, bytes))
+                });
+            }
             Ok(Ev::Down(link)) => {
                 writers.remove(&link);
-                node.handle(BearerEvent::Disconnected(link));
+                guard_core("bearer-disconnected", || {
+                    node.handle(BearerEvent::Disconnected(link))
+                });
             }
             Ok(Ev::Fetched(to, for_id, status, content_type, body)) => {
                 // Carry the origin's content-type back so a hops:// client (e.g. a WebView)
                 // renders each resource correctly (HTML/CSS/JS/image).
-                let _ = node.send_http_response(
-                    to,
-                    for_id,
-                    status,
-                    vec![("content-type".to_string(), content_type)],
-                    body,
-                );
+                guard_core("http-response", || {
+                    let _ = node.send_http_response(
+                        to,
+                        for_id,
+                        status,
+                        vec![("content-type".to_string(), content_type)],
+                        body,
+                    );
+                });
             }
-            Err(RecvTimeoutError::Timeout) => node.tick(now_ms()),
+            Err(RecvTimeoutError::Timeout) => {
+                guard_core("tick", || node.tick(now_ms()));
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        // Translate any inbound hops requests against our OWN origin (path only).
-        for r in node.take_http_requests() {
+        // Translate any inbound hops requests against our OWN origin (path only). take_http_requests
+        // parses attacker-controlled bundle contents, so guard it too; on a panic, skip this cycle.
+        let requests =
+            guard_core("take-http-requests", || node.take_http_requests()).unwrap_or_default();
+        for r in requests {
             // Protocol-level domain binding: refuse anything not addressed to our domain
             // BEFORE spawning a fetch. The signed `host` must equal our single --domain.
             let req_host = r.host.trim_end_matches('.').to_ascii_lowercase();
@@ -539,12 +569,29 @@ fn run(
             });
         }
 
-        for (link, bytes) in node.drain_outgoing() {
+        let outgoing = guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default();
+        for (link, bytes) in outgoing {
             if let Some(out) = writers.get(&link) {
                 if out.send(bytes).is_err() {
                     writers.remove(&link);
                 }
             }
+        }
+    }
+}
+
+/// services-r3-04: run a node call that touches attacker-controlled bytes under catch_unwind, so a
+/// core panic (e.g. on a malformed bundle) becomes a logged skip instead of tearing down the whole
+/// endpoint process. Mirrors how the accept threads wrap serve_conn. `node` is `&mut`, so the closure
+/// is `AssertUnwindSafe` (same as serve_conn's wrapper). Returns `None` if the call panicked.
+fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            // services-03: don't log the offending bytes (attacker-controlled + potentially sensitive
+            // per-message metadata); just note which stage panicked so the endpoint stays up.
+            eprintln!("hop-endpoint: core panic in {what}; skipped (endpoint stays up)");
+            None
         }
     }
 }
@@ -603,38 +650,49 @@ fn path_of(url: &str) -> String {
     }
 }
 
-/// Serve a plain HTTP request by reverse-proxying it to our OWN origin (path only) — the
-/// standard-HTTPS sibling of the hops:// path. The LB terminates TLS, so we speak plain HTTP
-/// here. Like the hops:// path it can never reach any host but our configured origin, so
-/// there's no open-proxy surface. v1 is GET/HEAD.
-fn serve_http_proxy(
-    mut stream: TcpStream,
-    origin: &str,
-    http: &reqwest::blocking::Client,
-    max_resp: u32,
-) {
-    // Read the request line + headers (up to the blank line); we only need method + path.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
+/// The parts of a plain-HTTP request head the proxy needs: the method, the raw request-target, and
+/// the real client IP parsed from `X-Forwarded-For` (if any).
+struct RequestHead {
+    method: String,
+    raw_path: String,
+    xff: Option<String>,
+}
+
+/// services-r3-03: read the request line + headers from a reader that is ALREADY byte-capped (the
+/// caller wraps the socket in `.take(MAX_REQ_HEAD_BYTES)`), so this cannot grow its buffers without
+/// bound. Returns `None` when there's nothing to serve (empty read) OR when the head is truncated by
+/// the cap before the blank-line terminator (a header block larger than the cap = a hostile client;
+/// the caller sheds it). Also captures `X-Forwarded-For` for the per-client rate limit (services-06).
+fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-        return;
+        return None; // no data (a bare TCP probe) — nothing to serve
+    }
+    // The request line itself must be complete (end in a newline). If the byte cap truncated it, the
+    // line has no trailing '\n' and we reject rather than parse a partial target.
+    if !request_line.ends_with('\n') {
+        return None; // request line exceeded the head-size cap
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let raw_path = parts.next().unwrap_or("/").to_string();
-    // Drain the rest of the headers so the client's send completes cleanly, capturing the
-    // real client IP from `X-Forwarded-For` (services-06).
+    // Drain the rest of the headers so the client's send completes cleanly, capturing the real
+    // client IP from `X-Forwarded-For`. The `.take()` cap bounds the total bytes read here.
     let mut xff: Option<String> = None;
     let mut line = String::new();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
+            // EOF at a line boundary: either a clean close after complete headers or the `.take`
+            // cap landing exactly on a boundary. We got only complete lines, so serve what we have
+            // (matches the original lenient behavior; the cap already bounds memory).
             Ok(0) => break,
-            Ok(_) if line == "\r\n" || line == "\n" => break,
+            Ok(_) if line == "\r\n" || line == "\n" => break, // end of the header block
+            Ok(_) if !line.ends_with('\n') => {
+                // A header line with no terminator means the byte cap truncated it mid-line: this is
+                // an oversized (hostile) head, so shed it rather than parse a partial header.
+                return None;
+            }
             Ok(_) => {
                 if let Some(v) = line
                     .split_once(':')
@@ -647,6 +705,51 @@ fn serve_http_proxy(
             Err(_) => break,
         }
     }
+    Some(RequestHead {
+        method,
+        raw_path,
+        xff,
+    })
+}
+
+/// Serve a plain HTTP request by reverse-proxying it to our OWN origin (path only) — the
+/// standard-HTTPS sibling of the hops:// path. The LB terminates TLS, so we speak plain HTTP
+/// here. Like the hops:// path it can never reach any host but our configured origin, so
+/// there's no open-proxy surface. v1 is GET/HEAD.
+fn serve_http_proxy(
+    mut stream: TcpStream,
+    origin: &str,
+    http: &reqwest::blocking::Client,
+    max_resp: u32,
+) {
+    // Read the request line + headers (up to the blank line); we only need method + path.
+    // services-r3-03: cap the total request-line + header bytes so a hostile client can't grow the
+    // read buffers until OOM. `.take(MAX_REQ_HEAD_BYTES)` bounds every read_line below; if the head
+    // exceeds the cap the reject is a shed connection, not process death.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let cloned = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(cloned.take(MAX_REQ_HEAD_BYTES));
+    let Some(head) = read_request_head(&mut reader) else {
+        // Over the head-size cap (or an empty/failed read): shed without touching the origin.
+        let body = b"hop-endpoint: request head too large";
+        let header = format!(
+            "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+        return;
+    };
+    let RequestHead {
+        method,
+        raw_path,
+        xff,
+    } = head;
 
     // services-08: a cheap liveness endpoint that never touches the origin, so the LB / uptime
     // checks can confirm the driver process is up (the sibling of relayd's F-17 /healthz).
@@ -730,6 +833,80 @@ fn serve_http_proxy(
     let _ = stream.flush();
 }
 
+/// What a peeked connection is: a WebSocket upgrade (a hops:// bearer link), a plain HTTP request
+/// (reverse-proxied to our origin), or nothing to serve (no bytes / a bare TCP probe).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PeekKind {
+    WsUpgrade,
+    HttpProxy,
+    Empty,
+}
+
+/// services-r3-05: decide from the peeked head bytes whether we can classify yet, and how. Returns
+/// `Some(kind)` once the decision is final: `WsUpgrade` if the `upgrade: websocket` token is present,
+/// `HttpProxy` once the whole header block has arrived (end-of-headers marker seen) with no upgrade
+/// token. Returns `None` while the head is still incomplete (no terminator yet AND no upgrade token),
+/// so the caller peeks again for the rest of a segmented handshake. Pure, so it is unit-testable.
+fn classify_head(head: &[u8]) -> Option<PeekKind> {
+    let req = String::from_utf8_lossy(head).to_ascii_lowercase();
+    if req.contains("upgrade: websocket") {
+        return Some(PeekKind::WsUpgrade);
+    }
+    // The header block is terminated by a blank line (CRLFCRLF, or bare-LF LFLF from lenient clients).
+    // Once we've seen it with no upgrade token, this is definitely a plain HTTP request.
+    if req.contains("\r\n\r\n") || req.contains("\n\n") {
+        return Some(PeekKind::HttpProxy);
+    }
+    None // head still incomplete: an upgrade header could yet arrive in a later segment
+}
+
+/// services-r3-05: classify an inbound connection from a NON-consuming peek, robust to a handshake
+/// split across TCP segments. Retries the peek (bounded by attempts and the read timeout) until the
+/// head is complete enough to decide (classify_head returns Some) or the buffer fills / we time out.
+/// On timeout / a full buffer with no decision, it falls back to the best guess from what arrived
+/// (so a slow client is never hung forever). The peek never consumes, so the handler re-reads.
+fn peek_kind(stream: &TcpStream) -> PeekKind {
+    let mut head = [0u8; 2048];
+    let mut last_n = 0usize;
+    // A handful of retries with a short sleep covers a segmented handshake without adding latency to
+    // the common single-segment case (the first peek already has the whole head). The socket's 5s
+    // read timeout is the hard ceiling; these attempts just re-peek as more segments land.
+    for attempt in 0..8 {
+        match stream.peek(&mut head) {
+            Ok(0) => return PeekKind::Empty, // clean EOF with nothing sent
+            Ok(n) => {
+                last_n = n;
+                if let Some(kind) = classify_head(&head[..n]) {
+                    return kind;
+                }
+                if n == head.len() {
+                    break; // buffer full and still undecided: stop peeking, guess below
+                }
+            }
+            // No data yet (non-blocking would-block) but the peer hasn't closed: wait briefly for the
+            // next segment, unless this is the very first attempt with nothing at all (a bare probe).
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if attempt == 0 && last_n == 0 {
+                    return PeekKind::Empty;
+                }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Undecided after the retries (no terminator, no upgrade token). If we saw ANY bytes, treat it as
+    // plain HTTP (the safe default: the proxy path re-reads and handles a partial/odd request); if we
+    // saw nothing, there's nothing to serve.
+    if last_n > 0 {
+        PeekKind::HttpProxy
+    } else {
+        PeekKind::Empty
+    }
+}
+
 /// Handle one inbound connection: a WebSocket becomes a Hop link (hops:// bearer); anything
 /// else is a plain HTTP request we reverse-proxy to our own origin, so `https://<domain>/`
 /// serves the same content as `hops://<domain>/`. We peek (non-consuming) to decide, leaving
@@ -743,16 +920,19 @@ fn serve_conn(
 ) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut head = [0u8; 1024];
-    match stream.peek(&mut head) {
-        Ok(n) if n > 0 => {
-            let req = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
-            if !req.contains("upgrade: websocket") {
-                serve_http_proxy(stream, origin, http, max_resp);
-                return;
-            }
+    // services-r3-05: classify WS-upgrade vs plain HTTP from a NON-consuming peek. A single peek can
+    // return only the first TCP segment, so a handshake split across segments (the `Upgrade:
+    // websocket` header arriving in a later packet than the request line) would misroute to the HTTP
+    // proxy. peek_kind retries the peek briefly until the head is complete enough to decide (it has
+    // seen the end-of-headers marker, or the upgrade token, or a bound), so a segmented handshake is
+    // classified correctly. The bytes stay in the socket buffer for whichever handler takes over.
+    match peek_kind(&stream) {
+        PeekKind::HttpProxy => {
+            serve_http_proxy(stream, origin, http, max_resp);
+            return;
         }
-        _ => return, // no data (e.g. a bare TCP probe) — nothing to serve
+        PeekKind::WsUpgrade => {}  // fall through to the WS handshake below
+        PeekKind::Empty => return, // no data (e.g. a bare TCP probe) — nothing to serve
     }
     let _ = stream.set_read_timeout(None); // hand a clean blocking socket to tungstenite
 
@@ -858,7 +1038,6 @@ fn write_secret_600(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     /// A throwaway one-shot HTTP/1.1 origin: it serves `n` sequential requests, each with a fixed
     /// status/content-type/body, and records the request line + `x-hop-scheme` header it saw so a
@@ -1349,5 +1528,188 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "rewrite must tighten perms, got {mode:o}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_request_head_rejects_an_oversized_header_block_instead_of_growing_unbounded() {
+        // services-r3-03: a hostile client that streams an endless request line / header block must be
+        // shed, not allowed to grow the read buffer until OOM. The reader is wrapped in
+        // `.take(MAX_REQ_HEAD_BYTES)`, so read_request_head can allocate at most that many bytes and
+        // returns None when the head is truncated by the cap. Before the fix, read_line had no cap and
+        // this input would grow a String without bound. We model the socket with a Cursor so the test
+        // is deterministic (no real OOM needed): the SAME `.take` cap the proxy uses bounds the read.
+        use std::io::Cursor;
+
+        // A single header line far larger than the cap, with NO terminator: the classic OOM attempt.
+        let hostile_len = (MAX_REQ_HEAD_BYTES as usize) * 4;
+        let mut hostile = Vec::with_capacity(hostile_len + 32);
+        hostile.extend_from_slice(b"GET / HTTP/1.1\r\nX-Bloat: ");
+        hostile.resize(hostile.len() + hostile_len, b'A'); // no CRLF, no blank line: never terminates
+        let mut reader = BufReader::new(Cursor::new(hostile).take(MAX_REQ_HEAD_BYTES));
+        assert!(
+            read_request_head(&mut reader).is_none(),
+            "an oversized header block is rejected (shed), not read unbounded into memory"
+        );
+
+        // A giant request LINE with no newline is likewise rejected (truncated by the cap).
+        let mut giant_line = Vec::new();
+        giant_line.extend_from_slice(b"GET /");
+        giant_line.resize(giant_line.len() + hostile_len, b'a'); // no '\n' anywhere
+        let mut reader = BufReader::new(Cursor::new(giant_line).take(MAX_REQ_HEAD_BYTES));
+        assert!(
+            read_request_head(&mut reader).is_none(),
+            "an oversized request line is rejected, not grown without bound"
+        );
+
+        // A normal, well-formed head under the cap still parses cleanly (no false rejection).
+        let ok = b"GET /path HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n".to_vec();
+        let mut reader = BufReader::new(Cursor::new(ok).take(MAX_REQ_HEAD_BYTES));
+        let head = read_request_head(&mut reader).expect("a normal head parses");
+        assert!(head.method.eq_ignore_ascii_case("GET"));
+        assert_eq!(head.raw_path, "/path");
+        assert_eq!(head.xff.as_deref(), Some("9.9.9.9"), "XFF still captured");
+    }
+
+    #[test]
+    fn serve_http_proxy_rejects_an_oversized_header_head_with_431_not_oom() {
+        // End-to-end over a real socket: a hostile oversized header head gets a 431 and the origin is
+        // NEVER touched (point the proxy at a dead port to prove no fetch happened). Before the fix,
+        // the header read would grow without bound toward OOM instead of a bounded 431 shed.
+        use std::net::TcpStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = test_client();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // Dead origin port: if the proxy ever fetched, it would 502, not 431.
+            serve_http_proxy(sock, "http://127.0.0.1:1", &http, 8 * 1024 * 1024);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Send the request line + a header that never terminates: stream well past the cap.
+        client.write_all(b"GET / HTTP/1.1\r\nX-Bloat: ").unwrap();
+        let chunk = vec![b'A'; 8 * 1024];
+        // Write ~1 MiB of header with no CRLF; the proxy caps its read at 64 KiB and sheds.
+        for _ in 0..128 {
+            if client.write_all(&chunk).is_err() {
+                break; // the server may close (shed) mid-stream, which is exactly the point
+            }
+        }
+        let _ = client.flush();
+
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        assert!(
+            resp.contains("431"),
+            "oversized head is shed with 431, not read into OOM; got: {:?}",
+            resp.chars().take(80).collect::<String>()
+        );
+        assert!(
+            !resp.contains("502"),
+            "the origin must NOT be dialed for an oversized head (no fetch happened)"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn guard_core_converts_a_core_panic_into_a_logged_skip_not_a_process_death() {
+        // services-r3-04: the driver runs node.handle(...) on the main thread. A core panic on a
+        // malformed bundle used to kill the whole endpoint (the accept threads DID catch_unwind, the
+        // driver did not). guard_core wraps those calls so a panic becomes a caught None and the loop
+        // continues. Revert the catch_unwind and this test's panicking closure unwinds the test.
+        let ok = guard_core("unit", || 41 + 1);
+        assert_eq!(ok, Some(42), "a non-panicking call returns its value");
+
+        let caught = guard_core::<()>("malformed-bundle", || {
+            panic!("simulated core panic on a hostile/malformed bundle");
+        });
+        assert!(
+            caught.is_none(),
+            "a core panic is caught and reported as a skip (endpoint stays up), not propagated"
+        );
+
+        // The endpoint is still usable after a caught panic: the next guarded call runs normally.
+        let after = guard_core("post-panic", || "still-alive");
+        assert_eq!(
+            after,
+            Some("still-alive"),
+            "the driver keeps processing events after a caught core panic"
+        );
+    }
+
+    #[test]
+    fn classify_head_handles_a_ws_handshake_split_across_tcp_segments() {
+        // services-r3-05: a single peek can return only the first TCP segment. If the request line
+        // arrives in one segment and `Upgrade: websocket` in the next, a one-shot classify would
+        // misroute the WS handshake to the HTTP proxy. classify_head returns None while the head is
+        // still incomplete (so peek_kind peeks again), Some(WsUpgrade) once the token arrives, and
+        // Some(HttpProxy) only once the whole header block is in with no upgrade token.
+
+        // Segment 1: just the request line — NOT decidable yet (could still be an upgrade).
+        assert_eq!(
+            classify_head(b"GET / HTTP/1.1\r\nHost: x\r\n"),
+            None,
+            "an incomplete head with no terminator and no token is undecided (peek again)"
+        );
+        // Segment 1 + 2 accumulated: the upgrade header has now arrived => WS upgrade.
+        assert_eq!(
+            classify_head(
+                b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+            Some(PeekKind::WsUpgrade),
+            "once Upgrade: websocket is seen the split handshake is classified as WS"
+        );
+        // A COMPLETE plain-HTTP head (blank line seen) with no upgrade token => proxy.
+        assert_eq!(
+            classify_head(b"GET /page HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Some(PeekKind::HttpProxy),
+            "a complete header block with no upgrade token is a plain HTTP request"
+        );
+        // Case-insensitive token match (the peek lowercases): an upper-case Upgrade header still wins.
+        assert_eq!(
+            classify_head(b"GET / HTTP/1.1\r\nUPGRADE: WEBSOCKET\r\n\r\n"),
+            Some(PeekKind::WsUpgrade),
+            "the upgrade token is matched case-insensitively"
+        );
+    }
+
+    #[test]
+    fn peek_kind_classifies_a_segmented_ws_upgrade_over_a_real_socket() {
+        // The end-to-end proof of the split-handshake fix: send the request line, pause, THEN send the
+        // Upgrade header in a separate write (a distinct TCP segment). peek_kind must retry the peek
+        // and still classify WsUpgrade. A one-shot peek (the old code) would have seen only the first
+        // segment and misrouted to the HTTP proxy.
+        use std::net::TcpStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            peek_kind(&sock)
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        // Segment 1: the request line only (no upgrade token yet).
+        client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(60)); // force a segment boundary
+                                                       // Segment 2: the upgrade header block.
+        client
+            .write_all(b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        let kind = server.join().unwrap();
+        assert_eq!(
+            kind,
+            PeekKind::WsUpgrade,
+            "a WS handshake split across TCP segments is still classified as an upgrade (not misrouted)"
+        );
     }
 }
