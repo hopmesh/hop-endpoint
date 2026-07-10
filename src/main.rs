@@ -109,6 +109,50 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// services-r2-02: resolve the relay endpoint from (CLI, `HOP_NO_RELAY`, `HOP_RELAY`) as a PURE
+/// function so the graceful-degrade precedence is unit-testable without spawning a process or
+/// mutating global env. This is the exact control that keeps the always-on example instance from
+/// spinning against a dead relay when the fleet is off; a regression here must fail a test, not CI.
+///
+/// Precedence:
+///  * A CLI `--relay`/`--no-relay` (`cli_set = true`) ALWAYS wins; env is ignored entirely.
+///  * Otherwise `HOP_NO_RELAY` in {`1`,`true`,`yes`} forces no relay (degrade).
+///  * Otherwise a non-empty `HOP_RELAY` overrides the default relay URL.
+///  * Otherwise the passed-in default (`cli_relay`) stands.
+fn resolve_relay(
+    cli_relay: Option<String>,
+    cli_set: bool,
+    no_relay_env: Option<&str>,
+    relay_env: Option<&str>,
+) -> Option<String> {
+    if cli_set {
+        return cli_relay; // an explicit --relay/--no-relay is authoritative
+    }
+    match no_relay_env {
+        Some("1") | Some("true") | Some("yes") => None,
+        _ => match relay_env {
+            Some(url) if !url.is_empty() => Some(url.to_string()),
+            _ => cli_relay,
+        },
+    }
+}
+
+/// services-r2-03: pick the per-source rate-limit key from an `X-Forwarded-For` header value.
+///
+/// XFF is `client, proxy1, proxy2, ...`, appended left-to-right as it traverses proxies. The LAST
+/// entry is the one appended by the closest trusted hop (our LB), so it is the only entry not fully
+/// client-controllable. Keying on the FIRST entry let a client rotate a spoofed leading value to
+/// dodge the per-source window; taking the LAST entry keys on the LB-appended hop instead. This is
+/// still only as trustworthy as the deployment's LB stripping/appending XFF; the accept-loop
+/// `peer_addr` limiter remains a GLOBAL backstop behind the LB (all LB traffic shares one peer IP),
+/// bounded absolutely by MAX_CONNS, not a per-user control.
+fn client_ip_from_xff(raw: &str) -> Option<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .rfind(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 fn main() {
     let mut listen = "0.0.0.0:9444".to_string();
     let mut origin: Option<String> = None;
@@ -148,18 +192,12 @@ fn main() {
     // set HOP_NO_RELAY=1 (or HOP_RELAY to a specific URL) so the always-on example instance doesn't
     // spin dialing a dead relay - it just serves its origin over plain HTTP. A CLI --relay/--no-relay
     // still wins; env only fills the default so the container needs no arg change to degrade.
-    if !relay_cli_set {
-        match std::env::var("HOP_NO_RELAY").as_deref() {
-            Ok("1") | Ok("true") | Ok("yes") => relay = None,
-            _ => {
-                if let Ok(url) = std::env::var("HOP_RELAY") {
-                    if !url.is_empty() {
-                        relay = Some(url);
-                    }
-                }
-            }
-        }
-    }
+    relay = resolve_relay(
+        relay,
+        relay_cli_set,
+        std::env::var("HOP_NO_RELAY").ok().as_deref(),
+        std::env::var("HOP_RELAY").ok().as_deref(),
+    );
     if relay.is_none() {
         println!("hop-endpoint: no relay configured; serving origin only (not mesh-routable)");
     }
@@ -566,8 +604,7 @@ fn serve_http_proxy(
                     .filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for"))
                     .map(|(_, v)| v)
                 {
-                    // XFF is "client, proxy1, proxy2"; the ORIGINAL client is the first entry.
-                    xff = v.split(',').next().map(|s| s.trim().to_string());
+                    xff = client_ip_from_xff(v);
                 }
             }
             Err(_) => break,
@@ -794,6 +831,83 @@ mod tests {
         assert_eq!(path_of("no-leading-slash"), "/no-leading-slash");
         assert_eq!(path_of("http://host"), "/");
         assert_eq!(path_of("/healthz"), "/healthz");
+    }
+
+    #[test]
+    fn resolve_relay_precedence_cli_wins_then_env_degrade() {
+        // services-r2-02: the graceful-degrade precedence is the control that keeps the always-on
+        // example instance from spinning against a dead relay when the fleet is off. Assert it as a
+        // pure function so a regression fails a test, not CI.
+        let default = || Some("wss://relay.hopme.sh/".to_string());
+
+        // 1. No CLI, no env -> the default relay stands (normal operation).
+        assert_eq!(resolve_relay(default(), false, None, None), default());
+
+        // 2. HOP_NO_RELAY=1/true/yes forces degrade (no relay) -> serve origin only when fleet off.
+        for v in ["1", "true", "yes"] {
+            assert_eq!(
+                resolve_relay(default(), false, Some(v), None),
+                None,
+                "HOP_NO_RELAY={v} degrades to no relay"
+            );
+        }
+        // A non-degrade value leaves the default in place.
+        assert_eq!(resolve_relay(default(), false, Some("0"), None), default());
+
+        // 3. HOP_RELAY overrides the default URL (when not degrading).
+        assert_eq!(
+            resolve_relay(default(), false, None, Some("wss://eu.relay/")),
+            Some("wss://eu.relay/".to_string())
+        );
+        // An empty HOP_RELAY is ignored (default stands).
+        assert_eq!(resolve_relay(default(), false, None, Some("")), default());
+        // HOP_NO_RELAY takes precedence over HOP_RELAY.
+        assert_eq!(
+            resolve_relay(default(), false, Some("1"), Some("wss://eu.relay/")),
+            None,
+            "degrade wins over an explicit HOP_RELAY"
+        );
+
+        // 4. A CLI --relay/--no-relay (cli_set=true) ALWAYS wins; env is ignored entirely.
+        assert_eq!(
+            resolve_relay(
+                Some("wss://cli/".into()),
+                true,
+                Some("1"),
+                Some("wss://env/")
+            ),
+            Some("wss://cli/".to_string()),
+            "explicit --relay overrides even HOP_NO_RELAY"
+        );
+        assert_eq!(
+            resolve_relay(None, true, None, Some("wss://env/")),
+            None,
+            "explicit --no-relay overrides HOP_RELAY"
+        );
+    }
+
+    #[test]
+    fn client_ip_from_xff_takes_the_trusted_last_hop() {
+        // services-r2-03: key the per-source limit on the LAST XFF entry (the LB-appended hop), not
+        // the FIRST (client-controllable) one, so a client can't rotate a spoofed leading value to
+        // dodge its window.
+        assert_eq!(
+            client_ip_from_xff("1.1.1.1, 2.2.2.2, 3.3.3.3").as_deref(),
+            Some("3.3.3.3"),
+            "last (LB-appended) hop, not the first client-supplied one"
+        );
+        assert_eq!(
+            client_ip_from_xff("9.9.9.9").as_deref(),
+            Some("9.9.9.9"),
+            "single entry is that entry"
+        );
+        // Whitespace + trailing-comma noise is trimmed; empties are ignored.
+        assert_eq!(
+            client_ip_from_xff("  1.1.1.1 ,  4.4.4.4 , ").as_deref(),
+            Some("4.4.4.4")
+        );
+        assert_eq!(client_ip_from_xff("").as_deref(), None);
+        assert_eq!(client_ip_from_xff(" , ").as_deref(), None);
     }
 
     #[test]
