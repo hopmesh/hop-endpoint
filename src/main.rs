@@ -51,6 +51,20 @@ impl Drop for ConnGuard {
     }
 }
 
+/// services-10: cap concurrent hops:// backend fetches. Each inbound mesh request spawned a thread
+/// with no bound, so a burst of mesh requests (which never pass the TCP-side IP limiter) could
+/// exhaust threads/memory on the single instance. Over the cap we shed the request with a 503.
+const MAX_INFLIGHT_FETCHES: usize = 128;
+static INFLIGHT_FETCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements the in-flight fetch count when a fetch worker finishes (incl. panic unwind).
+struct FetchGuard;
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// F-19: per-source fixed-window rate limit. One noisy client can otherwise monopolize the
 /// connection cap and the single instance; this bounds requests per source IP per window.
 const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
@@ -362,8 +376,19 @@ fn run(
                 let _ = tx.send(Ev::Fetched(r.from, r.id, 403, ct, body));
                 continue;
             }
+            // services-10: bound concurrent fetch workers. Mesh requests bypass the TCP IP limiter,
+            // so without this a burst spawns unbounded threads on the single instance. Over the cap
+            // reply 503 immediately rather than spawn.
+            if INFLIGHT_FETCHES.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_FETCHES {
+                INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
+                let ct = "text/plain; charset=utf-8".to_string();
+                let body = b"hop-endpoint: busy, try again".to_vec();
+                let _ = tx.send(Ev::Fetched(r.from, r.id, 503, ct, body));
+                continue;
+            }
             let (origin, http, tx) = (origin.clone(), http.clone(), tx.clone());
             std::thread::spawn(move || {
+                let _guard = FetchGuard; // decrements INFLIGHT_FETCHES on drop (incl. panic unwind)
                 let (status, ctype, body) = fetch(&http, &origin, &r, max_resp);
                 let _ = tx.send(Ev::Fetched(r.from, r.id, status, ctype, body));
             });
@@ -456,15 +481,62 @@ fn serve_http_proxy(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let raw_path = parts.next().unwrap_or("/").to_string();
-    // Drain the rest of the headers so the client's send completes cleanly.
+    // Drain the rest of the headers so the client's send completes cleanly, capturing the
+    // real client IP from `X-Forwarded-For` (services-06).
+    let mut xff: Option<String> = None;
     let mut line = String::new();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) if line == "\r\n" || line == "\n" => break,
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(v) = line
+                    .split_once(':')
+                    .filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for"))
+                    .map(|(_, v)| v)
+                {
+                    // XFF is "client, proxy1, proxy2"; the ORIGINAL client is the first entry.
+                    xff = v.split(',').next().map(|s| s.trim().to_string());
+                }
+            }
             Err(_) => break,
+        }
+    }
+
+    // services-08: a cheap liveness endpoint that never touches the origin, so the LB / uptime
+    // checks can confirm the driver process is up (the sibling of relayd's F-17 /healthz).
+    let path_only = path_of(&raw_path);
+    if method.eq_ignore_ascii_case("GET") && path_only == "/healthz" {
+        let body = b"ok";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+        return;
+    }
+
+    // services-06: behind Cloud Run / the shared LB the TCP peer is Google's front-end, not the
+    // end user, so the accept-loop peer_addr limiter buckets everyone together. Re-key the limit on
+    // the real client IP from X-Forwarded-For when present; shed a client over its window budget.
+    if let Some(ip_str) = &xff {
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            if !allow_source(ip) {
+                let body = b"hop-endpoint: rate limited";
+                let header = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+                return;
+            }
         }
     }
 
@@ -476,7 +548,7 @@ fn serve_http_proxy(
             b"hop-endpoint: only GET/HEAD over plain HTTP".to_vec(),
         )
     } else {
-        let url = format!("{origin}{}", path_of(&raw_path));
+        let url = format!("{origin}{path_only}");
         // The LB terminated TLS for us; tell the origin this came over standard https.
         match http.get(&url).header("x-hop-scheme", "https").send() {
             Ok(resp) => {
@@ -595,13 +667,102 @@ fn load_identity(path: &Option<String>) -> Identity {
             }
         }
         let id = Identity::generate();
-        if std::fs::write(path, id.to_secret_bytes()).is_err() {
+        // services-13: a 32-byte long-term secret written 0600 (owner-only), never world-readable,
+        // with a loud warning on failure (a silent drop means the DNS-published address goes stale).
+        if let Err(e) = write_secret_600(path, &id.to_secret_bytes()) {
             eprintln!(
-                "warning: could not persist identity to {path}; address will change on restart"
+                "warning: could not persist identity to {path}: {e}; address will change on restart"
             );
         }
         return id;
     }
     eprintln!("warning: no --identity-file; address will change on restart (DNS would go stale)");
     Identity::generate()
+}
+
+/// Write `bytes` to `path` with owner-only (0600) permissions (services-13). On Unix the mode is
+/// applied at create time so the secret is never briefly world-readable; non-Unix falls back to a
+/// plain write (the endpoint only ships on Unix).
+fn write_secret_600(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        // Re-assert 0600 in case the file pre-existed with looser perms (mode only applies on create).
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_of_reduces_to_path_and_never_leaks_a_host() {
+        // The endpoint must only ever fetch <origin><path>; a client-supplied scheme/host is dropped.
+        assert_eq!(path_of("https://evil.com/a/b?q=1"), "/a/b?q=1");
+        assert_eq!(path_of("hops://example.com/"), "/");
+        assert_eq!(path_of("/already/a/path"), "/already/a/path");
+        assert_eq!(path_of("no-leading-slash"), "/no-leading-slash");
+        assert_eq!(path_of("http://host"), "/");
+        assert_eq!(path_of("/healthz"), "/healthz");
+    }
+
+    #[test]
+    fn per_source_rate_limit_sheds_over_budget() {
+        // services-06: the fixed-window limiter admits up to the budget then sheds. Uses a unique IP
+        // per test run so the shared static map doesn't cross-contaminate.
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..MAX_REQ_PER_WINDOW {
+            assert!(allow_source(ip), "under budget is admitted");
+        }
+        assert!(
+            !allow_source(ip),
+            "the request past the window budget is shed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_secret_is_written_owner_only() {
+        // services-13: the persisted identity seed must be 0600 (owner-only), never world-readable.
+        use std::os::unix::fs::PermissionsExt;
+        let path = format!(
+            "{}/hop-endpoint-secret-{}.key",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&path);
+        write_secret_600(&path, &[7u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "identity seed must be owner-only, got {mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 32]);
+        // A pre-existing loose file is tightened on rewrite.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_600(&path, &[8u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rewrite must tighten perms, got {mode:o}");
+        let _ = std::fs::remove_file(&path);
+    }
 }
