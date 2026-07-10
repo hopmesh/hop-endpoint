@@ -109,33 +109,10 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// services-r2-02: resolve the relay endpoint from (CLI, `HOP_NO_RELAY`, `HOP_RELAY`) as a PURE
-/// function so the graceful-degrade precedence is unit-testable without spawning a process or
-/// mutating global env. This is the exact control that keeps the always-on example instance from
-/// spinning against a dead relay when the fleet is off; a regression here must fail a test, not CI.
-///
-/// Precedence:
-///  * A CLI `--relay`/`--no-relay` (`cli_set = true`) ALWAYS wins; env is ignored entirely.
-///  * Otherwise `HOP_NO_RELAY` in {`1`,`true`,`yes`} forces no relay (degrade).
-///  * Otherwise a non-empty `HOP_RELAY` overrides the default relay URL.
-///  * Otherwise the passed-in default (`cli_relay`) stands.
-fn resolve_relay(
-    cli_relay: Option<String>,
-    cli_set: bool,
-    no_relay_env: Option<&str>,
-    relay_env: Option<&str>,
-) -> Option<String> {
-    if cli_set {
-        return cli_relay; // an explicit --relay/--no-relay is authoritative
-    }
-    match no_relay_env {
-        Some("1") | Some("true") | Some("yes") => None,
-        _ => match relay_env {
-            Some(url) if !url.is_empty() => Some(url.to_string()),
-            _ => cli_relay,
-        },
-    }
-}
+// services-r3-03: the relay-degrade precedence now lives in ONE place, `hop_gateway::resolve_relay`,
+// so the gateway and endpoint binaries share a single tested implementation and cannot drift. The
+// endpoint imports it directly (see the `use hop_gateway::resolve_relay;` below).
+use hop_gateway::resolve_relay;
 
 /// services-r2-03: pick the per-source rate-limit key from an `X-Forwarded-For` header value.
 ///
@@ -143,14 +120,60 @@ fn resolve_relay(
 /// entry is the one appended by the closest trusted hop (our LB), so it is the only entry not fully
 /// client-controllable. Keying on the FIRST entry let a client rotate a spoofed leading value to
 /// dodge the per-source window; taking the LAST entry keys on the LB-appended hop instead. This is
-/// still only as trustworthy as the deployment's LB stripping/appending XFF; the accept-loop
-/// `peer_addr` limiter remains a GLOBAL backstop behind the LB (all LB traffic shares one peer IP),
-/// bounded absolutely by MAX_CONNS, not a per-user control.
+/// still only as trustworthy as the deployment's LB stripping/appending XFF. services-r3-02: behind
+/// a trusted LB the accept-loop `peer_addr` limiter is SKIPPED (see `accept_peer_limited`), because
+/// all LB traffic shares one peer IP and would otherwise be one global window; the count cap
+/// (`MAX_CONNS`) bounds resource use, and THIS XFF-keyed limiter is the per-client control.
 fn client_ip_from_xff(raw: &str) -> Option<String> {
     raw.split(',')
         .map(|s| s.trim())
         .rfind(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// services-r3-02: how the accept loop treats the raw TCP `peer_addr` for rate limiting.
+///
+/// Behind Cloud Run / a shared LB every client arrives from the SAME front-end IP, so the
+/// accept-loop `allow_source(peer.ip())` bucket lumps ALL users into one 100-req/10s window — a
+/// global availability cap that also sheds health probes (they share the LB IP) under load. The
+/// per-CLIENT control is the XFF-keyed limiter inside `serve_http_proxy`. When we know a trusted LB
+/// fronts us, the accept-loop peer bucket must be SKIPPED so it can't globally throttle; the count
+/// cap ([`MAX_CONNS`]) still bounds resource exhaustion, and per-client fairness is enforced on the
+/// real client IP downstream. When NOT behind a trusted proxy (direct exposure), the peer bucket
+/// stays on as the only per-source backstop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrustedProxy {
+    /// No trusted proxy configured: apply the accept-loop peer-IP limiter (direct exposure).
+    None,
+    /// Any inbound peer is a trusted LB front-end: skip the accept-loop peer-IP limiter entirely.
+    Any,
+    /// A specific trusted LB IP: skip the peer limiter only for that peer; limit everyone else.
+    Ip(IpAddr),
+}
+
+/// Resolve the trusted-proxy policy from `HOP_TRUSTED_PROXY`. `any` (or `1`/`true`/`yes`) ⇒ every
+/// peer is the LB (the Cloud Run / shared-LB deployment). A parseable IP ⇒ trust only that peer.
+/// Unset/empty/unparseable ⇒ `None` (direct exposure; keep the peer-IP limiter).
+fn resolve_trusted_proxy(env: Option<&str>) -> TrustedProxy {
+    match env.map(|s| s.trim()) {
+        Some("any") | Some("1") | Some("true") | Some("yes") => TrustedProxy::Any,
+        Some(s) if !s.is_empty() => match s.parse::<IpAddr>() {
+            Ok(ip) => TrustedProxy::Ip(ip),
+            Err(_) => TrustedProxy::None,
+        },
+        _ => TrustedProxy::None,
+    }
+}
+
+/// True ⇒ the accept loop should apply its per-`peer_addr` rate bucket to this peer. False ⇒ this
+/// peer is a trusted LB front-end, so skip the accept-loop bucket (the XFF limiter handles the real
+/// client). This is what prevents one global bucket from throttling all LB-fronted traffic.
+fn accept_peer_limited(peer_ip: IpAddr, trusted: TrustedProxy) -> bool {
+    match trusted {
+        TrustedProxy::None => true,          // direct exposure: limit every peer
+        TrustedProxy::Any => false,          // all peers are the LB: never limit at accept
+        TrustedProxy::Ip(t) => peer_ip != t, // limit everyone EXCEPT the trusted LB
+    }
 }
 
 fn main() {
@@ -200,6 +223,17 @@ fn main() {
     );
     if relay.is_none() {
         println!("hop-endpoint: no relay configured; serving origin only (not mesh-routable)");
+    }
+
+    // services-r3-02: when fronted by a trusted LB (Cloud Run / shared LB), skip the accept-loop
+    // per-peer rate bucket so all clients aren't lumped into one global window; per-client fairness
+    // is enforced on the real X-Forwarded-For IP downstream. Default None = direct exposure.
+    let trusted_proxy = resolve_trusted_proxy(std::env::var("HOP_TRUSTED_PROXY").ok().as_deref());
+    if trusted_proxy != TrustedProxy::None {
+        println!(
+            "hop-endpoint: trusted proxy = {trusted_proxy:?}; accept-loop peer rate limit skipped \
+             for the LB (per-client limit keyed on X-Forwarded-For)"
+        );
     }
 
     if print_address {
@@ -270,9 +304,12 @@ fn main() {
                 // F-19: bound concurrent connections so the one-thread-per-connection accept loop
                 // can't be driven to thread/memory exhaustion on the single 512Mi instance. Over the
                 // cap we shed load (drop the socket) rather than spawn unboundedly.
-                // F-19: shed a source that's over its per-window budget before spending a slot.
+                // F-19 / services-r3-02: shed a source over its per-window budget before spending a
+                // slot — but ONLY when the peer is NOT a trusted LB. Behind an LB every client shares
+                // the LB's IP, so this bucket would be a global availability cap (and shed health
+                // probes); there, per-client fairness is enforced on X-Forwarded-For in the proxy.
                 if let Ok(peer) = stream.peer_addr() {
-                    if !allow_source(peer.ip()) {
+                    if accept_peer_limited(peer.ip(), trusted_proxy) && !allow_source(peer.ip()) {
                         drop(stream);
                         continue;
                     }
@@ -821,6 +858,278 @@ fn write_secret_600(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
+
+    /// A throwaway one-shot HTTP/1.1 origin: it serves `n` sequential requests, each with a fixed
+    /// status/content-type/body, and records the request line + `x-hop-scheme` header it saw so a
+    /// test can assert the endpoint fetched `<origin><path>` (path only, no host) and stamped the
+    /// scheme. Returns the bound `http://127.0.0.1:PORT` origin and a receiver of `(request_line,
+    /// x_hop_scheme)` observations. Deliberately minimal (no keep-alive; `Connection: close`).
+    fn stub_origin(
+        n: usize,
+        status_line: &'static str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel::<(String, String)>();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).ok();
+                let mut scheme = String::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("x-hop-scheme") {
+                                    scheme = v.trim().to_string();
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send((req_line.trim_end().to_string(), scheme));
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.write_all(&body);
+                let _ = sock.flush();
+            }
+        });
+        (origin, rx)
+    }
+
+    fn test_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    fn req_item(method: &str, url: &str) -> hop_core::node::HttpReqItem {
+        hop_core::node::HttpReqItem {
+            from: [0u8; 32],
+            id: [1u8; 32],
+            host: "example.hopme.sh".into(),
+            method: method.into(),
+            url: url.into(),
+            headers: vec![],
+            body: vec![],
+            max_resp: 8 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn fetch_rejects_non_get_without_touching_the_backend() {
+        // v1 is GET-only: a POST (or any non-GET) is refused with 405 BEFORE any network call, so
+        // an unreachable/garbage origin is never even dialed. Point at a dead port to prove no fetch.
+        let http = test_client();
+        let (status, ctype, body) = fetch(
+            &http,
+            "http://127.0.0.1:1", // would 502 if actually dialed
+            &req_item("POST", "/x"),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(status, 405, "non-GET is rejected");
+        assert!(ctype.starts_with("text/plain"));
+        assert!(String::from_utf8_lossy(&body).contains("only GET"));
+        // Method match is case-insensitive but still GET-only: lowercase get is allowed through
+        // (would try to dial), delete is not.
+        let (s2, _, _) = fetch(&http, "http://127.0.0.1:1", &req_item("DELETE", "/x"), 1024);
+        assert_eq!(s2, 405, "DELETE is also rejected");
+    }
+
+    #[test]
+    fn fetch_hits_origin_plus_path_only_and_passes_status_ctype_body() {
+        // The endpoint must fetch <origin><path> — never the client-supplied host — and pass the
+        // origin's status, content-type, and body straight back. The client sends a full URL with a
+        // DIFFERENT host; the endpoint must strip it to the path and hit its OWN origin.
+        let (origin, rx) = stub_origin(
+            1,
+            "201 Created",
+            "text/html; charset=utf-8",
+            b"<h1>hi</h1>".to_vec(),
+        );
+        let http = test_client();
+        let (status, ctype, body) = fetch(
+            &http,
+            &origin,
+            &req_item("GET", "https://evil.example/page?q=1"),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(status, 201, "origin status is passed through");
+        assert_eq!(ctype, "text/html; charset=utf-8", "content-type preserved");
+        assert_eq!(body, b"<h1>hi</h1>");
+        // The origin saw the PATH only (host stripped) and the hops scheme stamp.
+        let (req_line, scheme) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            req_line, "GET /page?q=1 HTTP/1.1",
+            "fetched the path only, never the client's host"
+        );
+        assert_eq!(scheme, "hops", "the mesh scheme is stamped for the origin");
+    }
+
+    #[test]
+    fn fetch_truncates_a_body_over_max_resp() {
+        // max_resp is a hard cap on the translated body so a huge origin response can't blow memory
+        // on the single instance; the body is truncated to exactly the cap.
+        let (origin, _rx) = stub_origin(1, "200 OK", "application/octet-stream", vec![7u8; 5000]);
+        let http = test_client();
+        let (status, _ctype, body) = fetch(&http, &origin, &req_item("GET", "/big"), 100);
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 100, "body truncated to the max_resp cap");
+        assert!(body.iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn fetch_returns_502_when_the_backend_is_unreachable() {
+        // A refused/dead origin must surface as 502 (backend unreachable), not a panic or a hang.
+        let http = test_client();
+        let (status, ctype, body) = fetch(&http, "http://127.0.0.1:1", &req_item("GET", "/"), 1024);
+        assert_eq!(status, 502, "unreachable backend => 502");
+        assert!(ctype.starts_with("text/plain"));
+        assert!(String::from_utf8_lossy(&body).contains("unreachable"));
+    }
+
+    /// Drive `serve_http_proxy` over a real loopback TCP socket with the given raw request bytes and
+    /// return the full raw HTTP response the handler wrote back. `origin` is the backend it proxies
+    /// to (use a `stub_origin`, or a dead port for the 502 path).
+    fn drive_proxy(request: &[u8], origin: &str, max_resp: u32) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin = origin.to_string();
+        let http = test_client();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_http_proxy(sock, &origin, &http, max_resp);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => resp.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        server.join().unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    #[test]
+    fn http_proxy_healthz_never_touches_the_origin() {
+        // services-08: /healthz is a cheap liveness endpoint that must answer 200 "ok" WITHOUT
+        // dialing the origin (so it stays up even if the backend is down). Point at a dead port and
+        // still get a healthy 200.
+        let resp = drive_proxy(
+            b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n",
+            "http://127.0.0.1:1",
+            1024,
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "healthz => 200: {resp}"
+        );
+        assert!(
+            resp.trim_end().ends_with("ok"),
+            "healthz body is ok: {resp}"
+        );
+    }
+
+    #[test]
+    fn http_proxy_rejects_non_get_head_with_405() {
+        // Over plain HTTP the reverse proxy is GET/HEAD only; a POST is 405 and never hits the origin.
+        let resp = drive_proxy(
+            b"POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+            "http://127.0.0.1:1",
+            1024,
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 405"),
+            "POST over plain HTTP => 405: {resp}"
+        );
+        assert!(resp.contains("only GET/HEAD"));
+    }
+
+    #[test]
+    fn http_proxy_get_proxies_origin_body_and_head_omits_it() {
+        // A GET proxies the origin's status/content-type/body back. A HEAD to the SAME resource
+        // returns the same status line but NO body (the standard HEAD contract).
+        let (origin, _rx) = stub_origin(2, "200 OK", "text/plain; charset=utf-8", b"BODY".to_vec());
+        let get = drive_proxy(b"GET /r HTTP/1.1\r\nHost: x\r\n\r\n", &origin, 1024);
+        assert!(get.starts_with("HTTP/1.1 200 OK"));
+        assert!(get.contains("Content-Type: text/plain"));
+        assert!(
+            get.trim_end().ends_with("BODY"),
+            "GET returns the body: {get}"
+        );
+
+        let head = drive_proxy(b"HEAD /r HTTP/1.1\r\nHost: x\r\n\r\n", &origin, 1024);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "HEAD status: {head}");
+        assert!(
+            head.contains("Content-Length: 4"),
+            "HEAD still advertises the length: {head}"
+        );
+        assert!(
+            !head.trim_end().ends_with("BODY"),
+            "HEAD must not send the body: {head}"
+        );
+    }
+
+    #[test]
+    fn http_proxy_502s_when_origin_unreachable() {
+        // A GET to a dead origin surfaces 502 to the plain-HTTP client, not a hang.
+        let resp = drive_proxy(
+            b"GET /r HTTP/1.1\r\nHost: x\r\n\r\n",
+            "http://127.0.0.1:1",
+            1024,
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 502"),
+            "dead origin => 502: {resp}"
+        );
+    }
+
+    #[test]
+    fn http_proxy_rate_limits_on_the_real_client_ip_from_xff() {
+        // services-06: behind an LB the TCP peer is Google's front-end, so the per-client limit is
+        // re-keyed on the real client IP from X-Forwarded-For. Exhaust that IP's window directly, then
+        // a request carrying it in XFF must be shed with 429 (proving the proxy keys on XFF, not the
+        // loopback peer). Uses a unique IP so the shared static rate map isn't cross-contaminated.
+        let ip: IpAddr = "198.51.100.42".parse().unwrap();
+        for _ in 0..MAX_REQ_PER_WINDOW {
+            assert!(allow_source(ip));
+        }
+        // This IP is now over budget. A proxied request presenting it in XFF is rate-limited.
+        let req = b"GET /r HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.42\r\n\r\n";
+        let resp = drive_proxy(req, "http://127.0.0.1:1", 1024);
+        assert!(
+            resp.starts_with("HTTP/1.1 429"),
+            "an over-budget XFF client is rate-limited before the origin: {resp}"
+        );
+        assert!(resp.contains("rate limited"));
+    }
 
     #[test]
     fn path_of_reduces_to_path_and_never_leaks_a_host() {
@@ -921,6 +1230,63 @@ mod tests {
         assert!(
             !allow_source(ip),
             "the request past the window budget is shed"
+        );
+    }
+
+    #[test]
+    fn resolve_trusted_proxy_maps_env_to_policy() {
+        // services-r3-02: `any`/truthy => trust every peer (Cloud Run / shared LB); a bare IP =>
+        // trust only that peer; unset/empty/garbage => None (direct exposure, keep the limiter).
+        assert_eq!(resolve_trusted_proxy(Some("any")), TrustedProxy::Any);
+        assert_eq!(resolve_trusted_proxy(Some("1")), TrustedProxy::Any);
+        assert_eq!(resolve_trusted_proxy(Some("true")), TrustedProxy::Any);
+        assert_eq!(resolve_trusted_proxy(Some(" yes ")), TrustedProxy::Any);
+        assert_eq!(
+            resolve_trusted_proxy(Some("10.0.0.1")),
+            TrustedProxy::Ip("10.0.0.1".parse().unwrap())
+        );
+        assert_eq!(resolve_trusted_proxy(None), TrustedProxy::None);
+        assert_eq!(resolve_trusted_proxy(Some("")), TrustedProxy::None);
+        assert_eq!(
+            resolve_trusted_proxy(Some("not-an-ip")),
+            TrustedProxy::None,
+            "unparseable => direct exposure (fail closed to the safe limiter)"
+        );
+    }
+
+    #[test]
+    fn accept_loop_does_not_globally_rate_limit_behind_a_trusted_lb() {
+        // services-r3-02 (the core proof): behind a trusted LB every client shares ONE peer IP. The
+        // accept-loop peer bucket must be SKIPPED there, or ~100 req / 10s across ALL users combined
+        // would shed real traffic (and health probes) — a global availability cap. With the LB
+        // trusted, the accept loop never applies the peer limiter, so an unbounded number of LB-
+        // fronted requests pass the accept gate (per-client fairness is enforced on XFF downstream).
+        let lb_ip: IpAddr = "35.191.0.5".parse().unwrap(); // stand-in for the shared LB front-end
+
+        // Trust ANY peer (Cloud Run): the accept-loop bucket is never applied to the LB IP, so far
+        // MORE than MAX_REQ_PER_WINDOW connections from that one peer IP are admitted at the gate.
+        for _ in 0..(MAX_REQ_PER_WINDOW * 5) {
+            assert!(
+                !accept_peer_limited(lb_ip, TrustedProxy::Any),
+                "a trusted-any LB peer is never peer-rate-limited at accept"
+            );
+        }
+
+        // Trust only a specific LB IP: that peer is exempt; everyone else is still limited.
+        assert!(
+            !accept_peer_limited(lb_ip, TrustedProxy::Ip(lb_ip)),
+            "the configured trusted LB IP is exempt from the accept-loop bucket"
+        );
+        let other: IpAddr = "203.0.113.99".parse().unwrap();
+        assert!(
+            accept_peer_limited(other, TrustedProxy::Ip(lb_ip)),
+            "a non-trusted peer is still limited even when a specific LB IP is trusted"
+        );
+
+        // Direct exposure (no trusted proxy): the peer limiter still applies (the safe default).
+        assert!(
+            accept_peer_limited(lb_ip, TrustedProxy::None),
+            "with no trusted proxy the accept-loop peer limiter stays on as the backstop"
         );
     }
 
