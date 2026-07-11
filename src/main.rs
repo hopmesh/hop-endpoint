@@ -1,8 +1,8 @@
-//! # hop-endpoint — a `hops://` origin endpoint (DESIGN.md §30)
+//! # hop-endpoint - a `hops://` origin endpoint (DESIGN.md §30)
 //!
 //! An operator runs this on their own infrastructure to make their service reachable over
 //! Hop. It's a **listening** Hop node (clients dial it directly, so the operator bears the
-//! cost of their own traffic — our relay fleet is never a conduit for domain traffic) plus
+//! cost of their own traffic - our relay fleet is never a conduit for domain traffic) plus
 //! an HTTP translator **bound to one origin**: a `hops://` request carries only a path, and
 //! the endpoint executes it against its *own* configured backend. It is never an open proxy.
 //!
@@ -19,7 +19,7 @@
 //! Every `hops://` request carries a signed `host` field. The endpoint is configured with
 //! exactly one `--domain` and **rejects any request whose `host` is not that domain** (403)
 //! before it ever touches the backend. The URL it fetches is built *solely* from the
-//! configured `--origin` plus the request path — the request's own bytes never choose a host.
+//! configured `--origin` plus the request path - the request's own bytes never choose a host.
 //! Redirects are disabled, so the backend cannot bounce the endpoint off-origin either. There
 //! is no code path by which this process fetches anything other than `<origin><path>`.
 
@@ -36,6 +36,13 @@ use hop_core::prelude::*;
 use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
+
+/// services-r7-02: cap on a single inbound WS bearer message/frame, mirroring relayd's services-05
+/// `MAX_FRAME_BYTES`. The hops:// WS bearer accepts frames from ANY mesh peer that dials this public
+/// endpoint, so it must bound them at the mesh frame cap rather than tungstenite's 64 MiB default -
+/// otherwise one peer could push a 64 MiB frame the single always-on instance has to buffer. A frame
+/// over this cap drops the connection, exactly as the relay's raw-TCP/WS bearer paths reject one.
+const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
 
 /// F-19: cap on concurrent inbound connections, so the one-thread-per-connection accept loop can't
 /// exhaust threads/memory on the single always-on instance. Generous for legitimate traffic.
@@ -142,7 +149,7 @@ fn client_ip_from_xff(raw: &str) -> Option<String> {
 /// services-r3-02: how the accept loop treats the raw TCP `peer_addr` for rate limiting.
 ///
 /// Behind Cloud Run / a shared LB every client arrives from the SAME front-end IP, so the
-/// accept-loop `allow_source(peer.ip())` bucket lumps ALL users into one 100-req/10s window — a
+/// accept-loop `allow_source(peer.ip())` bucket lumps ALL users into one 100-req/10s window - a
 /// global availability cap that also sheds health probes (they share the LB IP) under load. The
 /// per-CLIENT control is the XFF-keyed limiter inside `serve_http_proxy`. When we know a trusted LB
 /// fronts us, the accept-loop peer bucket must be SKIPPED so it can't globally throttle; the count
@@ -330,7 +337,7 @@ fn main() {
                 // can't be driven to thread/memory exhaustion on the single 512Mi instance. Over the
                 // cap we shed load (drop the socket) rather than spawn unboundedly.
                 // F-19 / services-r3-02: shed a source over its per-window budget before spending a
-                // slot — but ONLY when the peer is NOT a trusted LB. Behind an LB every client shares
+                // slot - but ONLY when the peer is NOT a trusted LB. Behind an LB every client shares
                 // the LB's IP, so this bucket would be a global availability cap (and shed health
                 // probes); there, per-client fairness is enforced on X-Forwarded-For in the proxy.
                 if let Ok(peer) = stream.peer_addr() {
@@ -357,7 +364,7 @@ fn main() {
         });
     }
 
-    // Dial the relay (if configured) so the endpoint joins the mesh as a routable leaf —
+    // Dial the relay (if configured) so the endpoint joins the mesh as a routable leaf -
     // reachable by its address for messages, reconnecting forever (DESIGN.md §30).
     if let Some(relay_url) = relay {
         let tx = tx.clone();
@@ -380,7 +387,7 @@ fn build_endpoint(
     listen: &str,
 ) -> (Node, String, String) {
     // Bind to a single origin: scheme://host[:port], no trailing slash. Requests only ever get this
-    // prefix + their path — never an arbitrary host (no open proxy).
+    // prefix + their path - never an arbitrary host (no open proxy).
     let origin = origin.trim_end_matches('/').to_string();
     // The single authorized domain, normalized (case-insensitive, no trailing dot).
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
@@ -391,7 +398,7 @@ fn build_endpoint(
     // traces this address sees `example.hopme.sh`, not a bare short address.
     node.set_kind(NodeKind::Endpoint);
     node.set_name(Some(domain.clone()));
-    // A leaf: routable by address, but it never relays other nodes' bundles (§30) — domain traffic
+    // A leaf: routable by address, but it never relays other nodes' bundles (§30) - domain traffic
     // and the backbone don't flow *through* an endpoint.
     node.set_max_relayed(0);
     println!("hop-endpoint: address {}", bs58::encode(addr).into_string());
@@ -444,7 +451,7 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                 eprintln!("hop-endpoint: connected to relay {url}");
                 // Non-blocking socket: a read MUST NOT block, or the loop never gets back to
                 // send our outgoing Noise handshake msg1 (it's produced by the driver right
-                // after Ev::Up) — that deadlock leaves the WS open but the handshake unstarted,
+                // after Ev::Up) - that deadlock leaves the WS open but the handshake unstarted,
                 // so the relay never registers us as a peer. (A read timeout on a TLS stream
                 // didn't reliably surface as WouldBlock; non-blocking does.)
                 match ws.get_ref() {
@@ -671,7 +678,7 @@ fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
 }
 
 /// Execute one request against our origin. The request's `url` is treated as a **path** and
-/// appended to the fixed origin — the endpoint never fetches any other host. v1 is GET-only.
+/// appended to the fixed origin - the endpoint never fetches any other host. v1 is GET-only.
 fn fetch(
     http: &reqwest::blocking::Client,
     origin: &str,
@@ -705,7 +712,7 @@ fn fetch(
 }
 
 /// Reduce a request target to a path+query, discarding any scheme/host a client may have
-/// sent — so a request can only ever hit our own origin (no open proxy).
+/// sent - so a request can only ever hit our own origin (no open proxy).
 fn path_of(url: &str) -> String {
     let after = url
         .strip_prefix("https://")
@@ -740,7 +747,7 @@ struct RequestHead {
 fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-        return None; // no data (a bare TCP probe) — nothing to serve
+        return None; // no data (a bare TCP probe) - nothing to serve
     }
     // The request line itself must be complete (end in a newline). If the byte cap truncated it, the
     // line has no trailing '\n' and we reject rather than parse a partial target.
@@ -786,7 +793,7 @@ fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
     })
 }
 
-/// Serve a plain HTTP request by reverse-proxying it to our OWN origin (path only) — the
+/// Serve a plain HTTP request by reverse-proxying it to our OWN origin (path only) - the
 /// standard-HTTPS sibling of the hops:// path. The LB terminates TLS, so we speak plain HTTP
 /// here. Like the hops:// path it can never reach any host but our configured origin, so
 /// there's no open-proxy surface. v1 is GET/HEAD.
@@ -981,6 +988,19 @@ fn peek_kind(stream: &TcpStream) -> PeekKind {
     }
 }
 
+/// services-r7-02: the WebSocket config the inbound hops:// bearer accepts with. It caps a single
+/// message AND a single frame at [`MAX_FRAME_BYTES`], instead of tungstenite's 64 MiB default, so a
+/// mesh peer that dials this public endpoint cannot push a giant frame the single always-on instance
+/// must buffer (the relay enforces the identical cap on its WS bearer, services-05). Extracted so the
+/// cap is unit-testable and can't silently drift back to the default (`ws_bearer_config_rejects_...`).
+fn bearer_ws_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_BYTES),
+        max_frame_size: Some(MAX_FRAME_BYTES),
+        ..Default::default()
+    }
+}
+
 /// Handle one inbound connection: a WebSocket becomes a Hop link (hops:// bearer); anything
 /// else is a plain HTTP request we reverse-proxy to our own origin, so `https://<domain>/`
 /// serves the same content as `hops://<domain>/`. We peek (non-consuming) to decide, leaving
@@ -1006,11 +1026,13 @@ fn serve_conn(
             return;
         }
         PeekKind::WsUpgrade => {}  // fall through to the WS handshake below
-        PeekKind::Empty => return, // no data (e.g. a bare TCP probe) — nothing to serve
+        PeekKind::Empty => return, // no data (e.g. a bare TCP probe) - nothing to serve
     }
     let _ = stream.set_read_timeout(None); // hand a clean blocking socket to tungstenite
 
-    let mut ws = match tungstenite::accept(stream) {
+    // services-r7-02: accept with the bearer frame cap (bearer_ws_config) instead of tungstenite's
+    // 64 MiB default, so an oversized frame from any mesh peer is rejected rather than buffered.
+    let mut ws = match tungstenite::accept_with_config(stream, Some(bearer_ws_config())) {
         Ok(w) => w,
         Err(_) => return,
     };
@@ -1055,8 +1077,8 @@ fn serve_conn(
     let _ = ev_tx.send(Ev::Down(link));
 }
 
-/// Load a stable identity from a 32-byte file (so the endpoint's address — published in DNS
-/// — survives restarts), generating and persisting one on first run.
+/// Load a stable identity from a 32-byte file (so the endpoint's address - published in DNS
+/// - survives restarts), generating and persisting one on first run.
 fn load_identity(path: &Option<String>) -> Identity {
     if let Some(path) = path {
         if let Ok(bytes) = std::fs::read(path) {
@@ -1210,7 +1232,7 @@ mod tests {
 
     #[test]
     fn fetch_hits_origin_plus_path_only_and_passes_status_ctype_body() {
-        // The endpoint must fetch <origin><path> — never the client-supplied host — and pass the
+        // The endpoint must fetch <origin><path> - never the client-supplied host - and pass the
         // origin's status, content-type, and body straight back. The client sends a full URL with a
         // DIFFERENT host; the endpoint must strip it to the path and hit its OWN origin.
         let (origin, rx) = stub_origin(
@@ -1511,7 +1533,7 @@ mod tests {
     fn accept_loop_does_not_globally_rate_limit_behind_a_trusted_lb() {
         // services-r3-02 (the core proof): behind a trusted LB every client shares ONE peer IP. The
         // accept-loop peer bucket must be SKIPPED there, or ~100 req / 10s across ALL users combined
-        // would shed real traffic (and health probes) — a global availability cap. With the LB
+        // would shed real traffic (and health probes) - a global availability cap. With the LB
         // trusted, the accept loop never applies the peer limiter, so an unbounded number of LB-
         // fronted requests pass the accept gate (per-client fairness is enforced on XFF downstream).
         let lb_ip: IpAddr = "35.191.0.5".parse().unwrap(); // stand-in for the shared LB front-end
@@ -1723,7 +1745,7 @@ mod tests {
         // still incomplete (so peek_kind peeks again), Some(WsUpgrade) once the token arrives, and
         // Some(HttpProxy) only once the whole header block is in with no upgrade token.
 
-        // Segment 1: just the request line — NOT decidable yet (could still be an upgrade).
+        // Segment 1: just the request line - NOT decidable yet (could still be an upgrade).
         assert_eq!(
             classify_head(b"GET / HTTP/1.1\r\nHost: x\r\n"),
             None,
@@ -2090,6 +2112,52 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn ws_bearer_config_rejects_an_oversized_frame_at_the_cap() {
+        // services-r7-02: the inbound hops:// WS bearer accepts with bearer_ws_config(), which caps a
+        // single message/frame at MAX_FRAME_BYTES (the mesh frame cap relayd enforces via services-05)
+        // rather than tungstenite's 64 MiB default. Without it, a mesh peer that dials this public
+        // endpoint could push a giant frame the single always-on instance must buffer. Drive the REAL
+        // bearer_ws_config() serve_conn uses through accept_with_config over a socket with BLOCKING
+        // reads (so frame reassembly can't race a read timeout - this isolates the CAP): an under-cap
+        // frame reads Ok, an over-cap frame reads Err (rejected). Revert-proof: widening the cap back
+        // to tungstenite's default makes the over-cap frame below read Ok instead, failing the test.
+        use tungstenite::connect;
+
+        // The config carries exactly the mesh frame cap on BOTH the message and the frame size.
+        let cfg = bearer_ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_FRAME_BYTES));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || -> (bool, bool) {
+            let (sock, _) = listener.accept().unwrap();
+            // Accept with the SAME config serve_conn uses; blocking reads (no per-loop timeout).
+            let mut ws = tungstenite::accept_with_config(sock, Some(bearer_ws_config())).unwrap();
+            // An under-cap frame is delivered; the following over-cap frame is rejected as a read error.
+            let small_ok = matches!(ws.read(), Ok(Message::Binary(b)) if b.len() == 4);
+            let big_rejected = ws.read().is_err();
+            (small_ok, big_rejected)
+        });
+
+        let url = format!("ws://{addr}/");
+        let (mut ws, _resp) = connect(&url).expect("client WS handshake completes");
+        ws.send(Message::Binary(vec![1, 2, 3, 4])).unwrap();
+        ws.flush().unwrap();
+        // Over the cap by one byte: the client (default config) sends it; the capped server rejects it.
+        let _ = ws.send(Message::Binary(vec![0xABu8; MAX_FRAME_BYTES + 1]));
+        let _ = ws.flush();
+        let _ = ws.close(None);
+
+        let (small_ok, big_rejected) = server.join().unwrap();
+        assert!(small_ok, "an under-cap frame is delivered");
+        assert!(
+            big_rejected,
+            "an over-cap frame is rejected by the bearer frame cap, not buffered (pre-fix 64 MiB default)"
+        );
+    }
+
     // ---- peek_kind: the empty (bare probe) and byte-but-undecided fallbacks ---------------------
 
     #[test]
@@ -2240,7 +2308,7 @@ mod tests {
 
         // Hold the link writer alive for the WHOLE test. If it were dropped (e.g. bound as `_out` in a
         // match arm, which drops at the arm's end), dial_relay's out_rx would see Disconnected and tear
-        // the link down (Ev::Down) before it ever read the relay's data frame — an intermittent
+        // the link down (Ev::Down) before it ever read the relay's data frame - an intermittent
         // "Down with no Data" race. Keeping it alive removes the race entirely.
         let out = match ev_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Ev::Up(_link, role, out) => {
