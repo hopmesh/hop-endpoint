@@ -101,6 +101,7 @@ fn allow_source(ip: IpAddr) -> bool {
 }
 
 /// Driver events: bearer lifecycle + a completed backend fetch handed back from a worker.
+#[derive(Debug)]
 enum Ev {
     Up(u64, Role, Sender<Vec<u8>>),
     Data(u64, Vec<u8>),
@@ -183,19 +184,35 @@ fn accept_peer_limited(peer_ip: IpAddr, trusted: TrustedProxy) -> bool {
     }
 }
 
-fn main() {
+/// The parsed CLI configuration. Split out of `main` so the arg-parsing decision table is a pure,
+/// unit-testable function (it reads no globals and does no I/O), leaving `main` as orchestration.
+struct CliConfig {
+    listen: String,
+    origin: Option<String>,
+    domain: Option<String>,
+    identity_file: Option<String>,
+    max_resp: u32,
+    print_address: bool,
+    /// Dial a relay so the endpoint is reachable by its address on the mesh (can send/receive
+    /// messages), as a leaf that never carries others' traffic (DESIGN.md §30). Default on.
+    relay: Option<String>,
+    /// services-11: whether a --relay/--no-relay was given on the CLI, so env only fills the default.
+    relay_cli_set: bool,
+}
+
+/// Parse the endpoint's CLI flags into a [`CliConfig`]. Pure over its `args` iterator (no env, no
+/// I/O), so every flag/default path is unit-testable. Unknown flags are logged and ignored, matching
+/// the original lenient behavior.
+fn parse_args(args: impl Iterator<Item = String>) -> CliConfig {
     let mut listen = "0.0.0.0:9444".to_string();
     let mut origin: Option<String> = None;
     let mut domain: Option<String> = None;
     let mut identity_file: Option<String> = None;
     let mut max_resp: u32 = 8 * 1024 * 1024; // 8 MiB cap on a translated response
     let mut print_address = false;
-    // Dial a relay so the endpoint is reachable by its address on the mesh (can send/receive
-    // messages), as a leaf that never carries others' traffic (DESIGN.md §30). Default on.
     let mut relay: Option<String> = Some("wss://relay.hopme.sh/".to_string());
-    // services-11: whether a --relay/--no-relay was given on the CLI, so env only fills the default.
     let mut relay_cli_set = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--listen" => listen = args.next().unwrap_or(listen),
@@ -217,6 +234,29 @@ fn main() {
             other => eprintln!("ignoring unknown arg: {other}"),
         }
     }
+    CliConfig {
+        listen,
+        origin,
+        domain,
+        identity_file,
+        max_resp,
+        print_address,
+        relay,
+        relay_cli_set,
+    }
+}
+
+fn main() {
+    let CliConfig {
+        listen,
+        origin,
+        domain,
+        identity_file,
+        max_resp,
+        print_address,
+        mut relay,
+        relay_cli_set,
+    } = parse_args(std::env::args().skip(1));
 
     // services-11: graceful degrade when the relay fleet is off (relays_enabled=false). Infra can
     // set HOP_NO_RELAY=1 (or HOP_RELAY to a specific URL) so the always-on example instance doesn't
@@ -260,32 +300,10 @@ fn main() {
         );
         std::process::exit(2);
     });
-    // Bind to a single origin: scheme://host[:port], no trailing slash. Requests only ever
-    // get this prefix + their path — never an arbitrary host (no open proxy).
-    let origin = origin.trim_end_matches('/').to_string();
-    // The single authorized domain, normalized (case-insensitive, no trailing dot).
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-
     let identity = load_identity(&identity_file);
-    let addr = identity.address();
-    let mut node = Node::new(identity);
-    // Answer hop.identify as the domain we back (DESIGN.md §29/§30), so a peer that resolves
-    // or traces this address sees `example.hopme.sh`, not a bare short address.
-    node.set_kind(NodeKind::Endpoint);
-    node.set_name(Some(domain.clone()));
-    // A leaf: routable by address, but it never relays other nodes' bundles (§30) — domain
-    // traffic and the backbone don't flow *through* an endpoint.
-    node.set_max_relayed(0);
-    println!("hop-endpoint: address {}", bs58::encode(addr).into_string());
-    println!("hop-endpoint: authorized domain {domain}  (rejects any other host)");
-    println!("hop-endpoint: serving origin {origin}");
-    println!(
-        "hop-endpoint: publish DNS →  _hopaddress.{domain}  TXT  \"{}\"",
-        bs58::encode(addr).into_string()
-    );
-    println!(
-        "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin)"
-    );
+    // Normalize origin/domain and configure the leaf endpoint node bound to that domain (extracted
+    // so the normalization + node setup is unit-testable; main keeps the socket/thread orchestration).
+    let (node, origin, domain) = build_endpoint(origin, domain, identity, &listen);
 
     // Redirects are disabled: the backend can never bounce us to a different host.
     let http = reqwest::blocking::Client::builder()
@@ -348,6 +366,45 @@ fn main() {
     }
 
     run(node, domain, origin, http, max_resp, tx, rx);
+}
+
+/// Normalize the operator's `origin`/`domain`, build the leaf endpoint node bound to that domain,
+/// and log the operator-facing startup banner. Returns `(node, normalized_origin, normalized_domain)`.
+/// Split out of `main` so the normalization rules (strip a trailing `/` on the origin; lowercase and
+/// strip a trailing `.` on the domain) and the node configuration (Endpoint kind, name = domain, a
+/// leaf that relays nothing) are unit-testable without standing up sockets or the driver loop.
+fn build_endpoint(
+    origin: String,
+    domain: String,
+    identity: Identity,
+    listen: &str,
+) -> (Node, String, String) {
+    // Bind to a single origin: scheme://host[:port], no trailing slash. Requests only ever get this
+    // prefix + their path — never an arbitrary host (no open proxy).
+    let origin = origin.trim_end_matches('/').to_string();
+    // The single authorized domain, normalized (case-insensitive, no trailing dot).
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+
+    let addr = identity.address();
+    let mut node = Node::new(identity);
+    // Answer hop.identify as the domain we back (DESIGN.md §29/§30), so a peer that resolves or
+    // traces this address sees `example.hopme.sh`, not a bare short address.
+    node.set_kind(NodeKind::Endpoint);
+    node.set_name(Some(domain.clone()));
+    // A leaf: routable by address, but it never relays other nodes' bundles (§30) — domain traffic
+    // and the backbone don't flow *through* an endpoint.
+    node.set_max_relayed(0);
+    println!("hop-endpoint: address {}", bs58::encode(addr).into_string());
+    println!("hop-endpoint: authorized domain {domain}  (rejects any other host)");
+    println!("hop-endpoint: serving origin {origin}");
+    println!(
+        "hop-endpoint: publish DNS →  _hopaddress.{domain}  TXT  \"{}\"",
+        bs58::encode(addr).into_string()
+    );
+    println!(
+        "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin)"
+    );
+    (node, origin, domain)
 }
 
 /// services-11: reconnect backoff bounds. When the relay fleet is off (relays_enabled=false) the
@@ -537,37 +594,7 @@ fn run(
         // parses attacker-controlled bundle contents, so guard it too; on a panic, skip this cycle.
         let requests =
             guard_core("take-http-requests", || node.take_http_requests()).unwrap_or_default();
-        for r in requests {
-            // Protocol-level domain binding: refuse anything not addressed to our domain
-            // BEFORE spawning a fetch. The signed `host` must equal our single --domain.
-            let req_host = r.host.trim_end_matches('.').to_ascii_lowercase();
-            if req_host != domain {
-                eprintln!(
-                    "hop-endpoint: refusing host {:?} (authorized: {domain})",
-                    r.host
-                );
-                let body = format!("hop-endpoint: this endpoint only serves {domain}").into_bytes();
-                let ct = "text/plain; charset=utf-8".to_string();
-                let _ = tx.send(Ev::Fetched(r.from, r.id, 403, ct, body));
-                continue;
-            }
-            // services-10: bound concurrent fetch workers. Mesh requests bypass the TCP IP limiter,
-            // so without this a burst spawns unbounded threads on the single instance. Over the cap
-            // reply 503 immediately rather than spawn.
-            if INFLIGHT_FETCHES.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_FETCHES {
-                INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
-                let ct = "text/plain; charset=utf-8".to_string();
-                let body = b"hop-endpoint: busy, try again".to_vec();
-                let _ = tx.send(Ev::Fetched(r.from, r.id, 503, ct, body));
-                continue;
-            }
-            let (origin, http, tx) = (origin.clone(), http.clone(), tx.clone());
-            std::thread::spawn(move || {
-                let _guard = FetchGuard; // decrements INFLIGHT_FETCHES on drop (incl. panic unwind)
-                let (status, ctype, body) = fetch(&http, &origin, &r, max_resp);
-                let _ = tx.send(Ev::Fetched(r.from, r.id, status, ctype, body));
-            });
-        }
+        handle_http_requests(requests, &domain, &origin, &http, max_resp, &tx);
 
         let outgoing = guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default();
         for (link, bytes) in outgoing {
@@ -577,6 +604,53 @@ fn run(
                 }
             }
         }
+    }
+}
+
+/// Handle the batch of inbound `hops://` requests the node surfaced this cycle: enforce the
+/// protocol-level domain binding (reject a non-matching `host` with 403 before any backend touch),
+/// shed over the in-flight fetch cap with 503, and otherwise spawn a bounded worker to fetch the
+/// origin and reply. Split out of `run` so the security-critical routing decisions (domain binding,
+/// the busy cap) are unit-testable without wiring up the whole driver loop. Replies are sent as
+/// [`Ev::Fetched`] on `tx`, exactly as the inline loop did (behavior-preserving).
+fn handle_http_requests(
+    requests: Vec<hop_core::node::HttpReqItem>,
+    domain: &str,
+    origin: &str,
+    http: &reqwest::blocking::Client,
+    max_resp: u32,
+    tx: &Sender<Ev>,
+) {
+    for r in requests {
+        // Protocol-level domain binding: refuse anything not addressed to our domain
+        // BEFORE spawning a fetch. The signed `host` must equal our single --domain.
+        let req_host = r.host.trim_end_matches('.').to_ascii_lowercase();
+        if req_host != domain {
+            eprintln!(
+                "hop-endpoint: refusing host {:?} (authorized: {domain})",
+                r.host
+            );
+            let body = format!("hop-endpoint: this endpoint only serves {domain}").into_bytes();
+            let ct = "text/plain; charset=utf-8".to_string();
+            let _ = tx.send(Ev::Fetched(r.from, r.id, 403, ct, body));
+            continue;
+        }
+        // services-10: bound concurrent fetch workers. Mesh requests bypass the TCP IP limiter,
+        // so without this a burst spawns unbounded threads on the single instance. Over the cap
+        // reply 503 immediately rather than spawn.
+        if INFLIGHT_FETCHES.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_FETCHES {
+            INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
+            let ct = "text/plain; charset=utf-8".to_string();
+            let body = b"hop-endpoint: busy, try again".to_vec();
+            let _ = tx.send(Ev::Fetched(r.from, r.id, 503, ct, body));
+            continue;
+        }
+        let (origin, http, tx) = (origin.to_string(), http.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let _guard = FetchGuard; // decrements INFLIGHT_FETCHES on drop (incl. panic unwind)
+            let (status, ctype, body) = fetch(&http, &origin, &r, max_resp);
+            let _ = tx.send(Ev::Fetched(r.from, r.id, status, ctype, body));
+        });
     }
 }
 
@@ -1710,6 +1784,931 @@ mod tests {
             kind,
             PeekKind::WsUpgrade,
             "a WS handshake split across TCP segments is still classified as an upgrade (not misrouted)"
+        );
+    }
+
+    // ---- parse_args: the CLI decision table (pure over its arg iterator) ------------------------
+
+    fn args_of(a: &[&str]) -> std::vec::IntoIter<String> {
+        a.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn parse_args_applies_the_documented_defaults_with_no_flags() {
+        // With no CLI flags the endpoint takes its documented defaults: bind 9444, 8 MiB response
+        // cap, dial the default relay, and require --origin/--domain later (so they're None here).
+        let c = parse_args(std::iter::empty::<String>());
+        assert_eq!(c.listen, "0.0.0.0:9444");
+        assert!(c.origin.is_none(), "origin defaults unset (required later)");
+        assert!(c.domain.is_none(), "domain defaults unset (required later)");
+        assert!(c.identity_file.is_none());
+        assert_eq!(c.max_resp, 8 * 1024 * 1024);
+        assert!(!c.print_address);
+        assert_eq!(
+            c.relay.as_deref(),
+            Some("wss://relay.hopme.sh/"),
+            "the default relay is dialed unless overridden"
+        );
+        assert!(!c.relay_cli_set, "no --relay/--no-relay was given");
+    }
+
+    #[test]
+    fn parse_args_reads_every_flag_and_ignores_unknowns() {
+        // Each flag maps to its field; an unrecognized flag is logged and skipped (lenient), not fatal.
+        let c = parse_args(args_of(&[
+            "--listen",
+            "1.2.3.4:80",
+            "--origin",
+            "http://backend:8080/",
+            "--domain",
+            "Example.HopMe.sh.",
+            "--identity-file",
+            "/etc/hop/id.key",
+            "--max-resp",
+            "4096",
+            "--relay",
+            "wss://eu.relay/",
+            "--print-address",
+            "--totally-unknown-flag",
+        ]));
+        assert_eq!(c.listen, "1.2.3.4:80");
+        assert_eq!(c.origin.as_deref(), Some("http://backend:8080/"));
+        // parse_args keeps the raw values; normalization (trim slash / lowercase) happens in main.
+        assert_eq!(c.domain.as_deref(), Some("Example.HopMe.sh."));
+        assert_eq!(c.identity_file.as_deref(), Some("/etc/hop/id.key"));
+        assert_eq!(c.max_resp, 4096);
+        assert!(c.print_address);
+        assert_eq!(c.relay.as_deref(), Some("wss://eu.relay/"));
+        assert!(c.relay_cli_set, "an explicit --relay marks the CLI as set");
+    }
+
+    #[test]
+    fn parse_args_no_relay_clears_the_relay_and_marks_cli_set() {
+        // --no-relay runs the endpoint isolated (listening only); it must clear the default relay AND
+        // record that the CLI decided, so env (HOP_RELAY/HOP_NO_RELAY) can't override the operator.
+        let c = parse_args(args_of(&["--no-relay"]));
+        assert!(c.relay.is_none(), "--no-relay clears the relay");
+        assert!(
+            c.relay_cli_set,
+            "--no-relay marks the CLI as set (env won't override)"
+        );
+    }
+
+    #[test]
+    fn parse_args_bad_max_resp_falls_back_to_the_default() {
+        // A non-numeric --max-resp is ignored rather than aborting startup: keep the safe default cap.
+        let c = parse_args(args_of(&["--max-resp", "not-a-number"]));
+        assert_eq!(
+            c.max_resp,
+            8 * 1024 * 1024,
+            "garbage --max-resp keeps the default"
+        );
+        // A --listen with no following value keeps the previous (default) listen rather than panicking.
+        let c = parse_args(args_of(&["--listen"]));
+        assert_eq!(
+            c.listen, "0.0.0.0:9444",
+            "a dangling --listen keeps the default"
+        );
+    }
+
+    #[test]
+    fn now_ms_returns_a_plausible_unix_millis() {
+        // now_ms is the driver's clock source for node.tick; just prove it returns a sane, advancing
+        // unix-millis value (well past 2020, and non-decreasing across two reads).
+        let a = now_ms();
+        let b = now_ms();
+        assert!(
+            a >= 1_600_000_000_000,
+            "now_ms is unix millis (past 2020): {a}"
+        );
+        assert!(
+            b >= a,
+            "the wall clock does not go backwards across two reads"
+        );
+    }
+
+    // ---- handle_http_requests: domain binding + the busy cap + the fetch happy path -------------
+
+    fn req_item_host(method: &str, url: &str, host: &str) -> hop_core::node::HttpReqItem {
+        let mut r = req_item(method, url);
+        r.host = host.into();
+        r
+    }
+
+    fn recv_fetched(rx: &mpsc::Receiver<Ev>) -> (u16, String, Vec<u8>) {
+        match rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("a reply was produced")
+        {
+            Ev::Fetched(_to, _id, status, ctype, body) => (status, ctype, body),
+            other => panic!("expected Ev::Fetched, got a different event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_http_requests_enforces_domain_binding_serves_matches_and_sheds_when_busy() {
+        // The security-critical routing block, tested directly (it was inline in `run`). Three paths:
+        //   1. a host that isn't our --domain is refused 403 WITHOUT touching the backend,
+        //   2. a request for our domain is fetched from the origin and the reply passed back,
+        //   3. over the in-flight fetch cap the request is shed with 503 (no worker spawned).
+        let http = test_client();
+        let (tx, rx) = mpsc::channel::<Ev>();
+        let domain = "example.hopme.sh";
+
+        // 1. Wrong host -> 403, and the dead origin proves no backend fetch happened (no 502 hang).
+        handle_http_requests(
+            vec![req_item_host("GET", "/x", "evil.example")],
+            domain,
+            "http://127.0.0.1:1",
+            &http,
+            1024,
+            &tx,
+        );
+        let (status, ctype, body) = recv_fetched(&rx);
+        assert_eq!(status, 403, "a non-authorized host is refused");
+        assert!(ctype.starts_with("text/plain"));
+        assert!(String::from_utf8_lossy(&body).contains("only serves example.hopme.sh"));
+
+        // A trailing dot / different case on the request host still matches (normalized like --domain).
+        let (origin, _o) = stub_origin(1, "200 OK", "text/plain; charset=utf-8", b"ok".to_vec());
+        handle_http_requests(
+            vec![req_item_host("GET", "/y", "Example.HopMe.sh.")],
+            domain,
+            &origin,
+            &http,
+            1024,
+            &tx,
+        );
+        let (status, _ct, body) = recv_fetched(&rx);
+        assert_eq!(
+            status, 200,
+            "a matching host (case/dot-insensitive) is served"
+        );
+        assert_eq!(body, b"ok", "the origin body is passed back");
+        // Let the worker's FetchGuard drop so INFLIGHT_FETCHES settles back to 0 before the cap test.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 3. Over the in-flight cap: shed with 503 before spawning any worker. Simulate saturation by
+        // pinning the counter at the cap, then restore it so the shared global isn't left dirty.
+        INFLIGHT_FETCHES.fetch_add(MAX_INFLIGHT_FETCHES, Ordering::SeqCst);
+        handle_http_requests(
+            vec![req_item("GET", "/z")], // host defaults to example.hopme.sh (matches)
+            domain,
+            "http://127.0.0.1:1", // dead: if a worker DID spawn this would be 502, not 503
+            &http,
+            1024,
+            &tx,
+        );
+        INFLIGHT_FETCHES.fetch_sub(MAX_INFLIGHT_FETCHES, Ordering::SeqCst);
+        let (status, _ct, body) = recv_fetched(&rx);
+        assert_eq!(
+            status, 503,
+            "over the fetch cap the request is shed, not queued"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("busy"));
+    }
+
+    // ---- load_identity: stable-from-file, generate-and-persist, ephemeral ------------------------
+
+    #[test]
+    fn load_identity_is_stable_from_a_seed_file_and_persists_a_fresh_one() {
+        // The DNS-published address must survive restarts: loading the same seed file yields the same
+        // address, and a first run with a missing path GENERATES and PERSISTS a seed so the next load
+        // is stable too. A None path is ephemeral (address changes each run).
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        // Case A: an existing 32-byte seed file -> the same address on every load.
+        let seed_path = format!("{}/hop-endpoint-seed-A-{pid}.key", dir.display());
+        std::fs::write(&seed_path, [7u8; 32]).unwrap();
+        let a1 = load_identity(&Some(seed_path.clone()));
+        let a2 = load_identity(&Some(seed_path.clone()));
+        assert_eq!(
+            a1.address(),
+            a2.address(),
+            "a fixed seed file yields a stable address"
+        );
+        let _ = std::fs::remove_file(&seed_path);
+
+        // Case B: a missing path -> generate + persist, and the persisted seed reloads to the SAME
+        // address (so the published DNS record stays valid across restarts).
+        let gen_path = format!("{}/hop-endpoint-seed-B-{pid}.key", dir.display());
+        let _ = std::fs::remove_file(&gen_path);
+        let b1 = load_identity(&Some(gen_path.clone()));
+        assert!(
+            std::path::Path::new(&gen_path).exists(),
+            "a fresh identity is persisted"
+        );
+        let b2 = load_identity(&Some(gen_path.clone()));
+        assert_eq!(
+            b1.address(),
+            b2.address(),
+            "the persisted seed reloads to the same address"
+        );
+        let _ = std::fs::remove_file(&gen_path);
+
+        // Case C: no path -> an ephemeral identity (just a well-formed 32-byte address).
+        let c = load_identity(&None);
+        assert_eq!(
+            c.address().len(),
+            32,
+            "an ephemeral identity still has a 32-byte address"
+        );
+    }
+
+    // ---- serve_conn: the WebSocket (hops:// bearer) path, end to end over a real socket ---------
+
+    #[test]
+    fn serve_conn_bridges_a_websocket_as_a_hop_link_both_directions() {
+        // A real WS client drives serve_conn's bearer path: the connection surfaces as Ev::Up(Responder)
+        // with a writer; a client Binary frame becomes Ev::Data; bytes pushed to the writer are written
+        // back to the client (out_rx -> ws.write); and a client close becomes Ev::Down. This exercises
+        // the whole per-connection loop that the driver relies on.
+        use tungstenite::connect;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let http = test_client();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_conn(sock, &ev_tx, "http://127.0.0.1:1", &http, 1024);
+        });
+
+        let url = format!("ws://{addr}/");
+        let (mut ws, _resp) = connect(&url).expect("client WS handshake completes");
+
+        // The connection came up as a responder-side Hop link with a writer we can push bytes into.
+        let out = match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Up(_link, role, out) => {
+                assert_eq!(
+                    role,
+                    Role::Responder,
+                    "an accepted WS is the Responder side"
+                );
+                out
+            }
+            other => panic!("expected Ev::Up first, got {other:?}"),
+        };
+
+        // Client -> endpoint: a Binary frame surfaces as Ev::Data with the exact bytes.
+        ws.send(Message::Binary(vec![1, 2, 3, 4])).unwrap();
+        ws.flush().unwrap();
+        match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Data(_link, bytes) => {
+                assert_eq!(bytes, vec![1, 2, 3, 4], "the frame bytes pass through")
+            }
+            other => panic!("expected Ev::Data, got {other:?}"),
+        }
+
+        // Endpoint -> client: bytes pushed to the link writer are written back over the socket.
+        out.send(vec![9, 8, 7]).unwrap();
+        let got = loop {
+            match ws.read().unwrap() {
+                Message::Binary(b) => break b,
+                _ => continue, // skip any ping/pong control frames
+            }
+        };
+        assert_eq!(
+            got,
+            vec![9, 8, 7],
+            "writer bytes are delivered to the client"
+        );
+
+        // Client close -> Ev::Down (the link is torn down).
+        ws.close(None).unwrap();
+        let _ = ws.flush();
+        // Drain the client so tungstenite completes the close handshake.
+        while ws.read().is_ok() {}
+        match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Down(_link) => {}
+            other => panic!("expected Ev::Down on close, got {other:?}"),
+        }
+        server.join().unwrap();
+    }
+
+    // ---- peek_kind: the empty (bare probe) and byte-but-undecided fallbacks ---------------------
+
+    #[test]
+    fn peek_kind_reports_empty_on_a_bare_tcp_probe() {
+        // A connection that opens and closes without sending a byte (a bare TCP probe / health check
+        // at the socket layer) classifies as Empty, so serve_conn serves nothing rather than hanging.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            peek_kind(&sock)
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        drop(client); // send nothing, close immediately -> clean EOF
+        assert_eq!(
+            server.join().unwrap(),
+            PeekKind::Empty,
+            "a bare probe is Empty"
+        );
+    }
+
+    #[test]
+    fn peek_kind_falls_back_to_http_proxy_for_bytes_without_a_terminator() {
+        // A client that sends a partial head (bytes, but no end-of-headers marker and no upgrade token)
+        // must NOT hang forever: after the bounded peek retries, peek_kind falls back to HttpProxy (the
+        // safe default) so the proxy path re-reads and handles the odd/partial request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            peek_kind(&sock)
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        // A request line with no blank-line terminator and no upgrade token: undecidable, so peek_kind
+        // exhausts its retries and guesses HttpProxy. Keep the socket open through the retry window.
+        client
+            .write_all(b"GET /partial HTTP/1.1\r\nHost: x\r\n")
+            .unwrap();
+        client.flush().unwrap();
+        let kind = server.join().unwrap();
+        assert_eq!(
+            kind,
+            PeekKind::HttpProxy,
+            "bytes with no terminator fall back to the HTTP proxy, not a hang"
+        );
+        drop(client);
+    }
+
+    // ---- run: the driver event loop dispatches Up/Data/Down/Fetched and routes outgoing ---------
+
+    #[test]
+    fn run_driver_dispatches_events_and_routes_outgoing_to_the_link_writer() {
+        // Drive the real driver loop: an Ev::Up(Initiator) registers a writer AND makes the node emit
+        // its Noise handshake msg1, which the driver must route back to that link's writer (out_rx).
+        // Then Ev::Data (garbage, guarded), Ev::Fetched (guarded send_http_response), and Ev::Down all
+        // dispatch without tearing the loop down. The loop owns a tx clone so it never sees Disconnect;
+        // we assert the observable msg1 routing, then let the daemon thread go (it can't be stopped from
+        // outside by design, mirroring the always-on production loop).
+        let node = Node::new(Identity::generate());
+        let (tx, rx) = mpsc::channel::<Ev>();
+        let driver_tx = tx.clone();
+        let http = test_client();
+        std::thread::spawn(move || {
+            run(
+                node,
+                "example.hopme.sh".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                http,
+                1024,
+                driver_tx,
+                rx,
+            );
+        });
+
+        // Ev::Up as the Initiator: the node produces handshake msg1, which the driver routes to out_rx.
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(Ev::Up(1, Role::Initiator, out_tx)).unwrap();
+        let msg1 = out_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the driver routed the node's handshake msg1 to the link writer");
+        assert!(!msg1.is_empty(), "the routed handshake frame is non-empty");
+
+        // Feed the remaining event arms; each must dispatch under guard_core without panicking the loop.
+        tx.send(Ev::Data(1, vec![0xde, 0xad, 0xbe, 0xef])).unwrap(); // garbage bundle: guarded parse
+        tx.send(Ev::Fetched(
+            [0u8; 32],
+            [1u8; 32],
+            200,
+            "text/plain; charset=utf-8".to_string(),
+            b"body".to_vec(),
+        ))
+        .unwrap();
+        tx.send(Ev::Down(1)).unwrap();
+        // Give the loop time to process those arms and fire at least one recv_timeout tick.
+        std::thread::sleep(Duration::from_millis(1200));
+        // The loop is still alive (owns its tx); the test's observable proof was the routed msg1 above.
+        drop(tx);
+    }
+
+    // ---- dial_relay: the connected bridge path and the unreachable-relay backoff path -----------
+
+    #[test]
+    fn dial_relay_bridges_a_relay_ws_as_an_initiator_link_and_reports_down_on_close() {
+        // Point dial_relay at a local WS server standing in for a relay: it must connect, surface
+        // Ev::Up(Initiator) with a writer, relay a server Binary frame as Ev::Data, and report Ev::Down
+        // when the relay closes. This covers the connected read/write bridge (the reconnect backoff on
+        // the pure side is already covered by reconnect_backoff's test).
+        //
+        // Determinism note: the relay-side server keeps the connection OPEN and actively re-sends the
+        // data frame until the test flips `stop`. If instead it sent one frame and closed, a heavily
+        // slowed (e.g. coverage-instrumented) endpoint thread could be scheduled only AFTER the socket
+        // was already closed, so its first `ws.read()` would return ConnectionClosed and it would report
+        // Down having never drained the buffered data. Holding the connection open (and only closing
+        // once the test has observed the data) makes "data before close" a guarantee, not a race.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_nodelay(true).ok(); // no Nagle batching: frames ship immediately
+            let mut ws = tungstenite::accept(sock).expect("relay-side WS handshake");
+            // Keep an open, actively-flowing connection so the endpoint can never observe a closed
+            // socket before it has drained a data frame. Re-send until the test says stop.
+            while !stop_srv.load(Ordering::Relaxed) {
+                if ws.send(Message::Binary(vec![5, 6, 7])).is_err() {
+                    break;
+                }
+                if ws.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let _ = ws.close(None); // now close so the endpoint reports Ev::Down
+            while ws.read().is_ok() {}
+        });
+
+        let url = format!("ws://{addr}/");
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        // dial_relay reconnects forever; run it detached and just observe the first connection's events.
+        std::thread::spawn(move || dial_relay(url, ev_tx));
+
+        // Hold the link writer alive for the WHOLE test. If it were dropped (e.g. bound as `_out` in a
+        // match arm, which drops at the arm's end), dial_relay's out_rx would see Disconnected and tear
+        // the link down (Ev::Down) before it ever read the relay's data frame — an intermittent
+        // "Down with no Data" race. Keeping it alive removes the race entirely.
+        let out = match ev_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Ev::Up(_link, role, out) => {
+                assert_eq!(role, Role::Initiator, "the dialer is the Initiator");
+                out
+            }
+            other => panic!("expected Ev::Up(Initiator) first, got {other:?}"),
+        };
+        // The relay's data frame is surfaced as Ev::Data with the exact bytes (the connection is still
+        // open and flowing, so this is guaranteed to arrive before any close).
+        match ev_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Ev::Data(_l, b) => assert_eq!(b, vec![5, 6, 7], "the relay frame bytes pass through"),
+            other => panic!("expected Ev::Data while the relay is still open, got {other:?}"),
+        }
+        // Endpoint -> relay: bytes pushed to the link writer are written out over the WS (dial_relay's
+        // out_rx -> ws.write path, incl. the one-shot "sent handshake" log). The relay drains them when
+        // it closes below.
+        out.send(vec![1, 2, 3]).unwrap();
+        // Now let the relay close and confirm the endpoint reports the link Down (draining any extra
+        // buffered data frames first).
+        stop.store(true, Ordering::Relaxed);
+        loop {
+            match ev_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Ev::Down(_l) => break,        // clean close reported
+                Ev::Data(_l, _b) => continue, // drain frames buffered before the close
+                other => panic!("expected Ev::Down after the relay closes, got {other:?}"),
+            }
+        }
+        drop(out); // release the writer only after the link teardown was observed
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn dial_relay_reports_the_degraded_state_when_the_relay_is_unreachable() {
+        // A dead relay (connection refused) must NOT surface a link: dial_relay takes the error/backoff
+        // branch (log + reconnect_backoff sleep) and no Ev::Up ever arrives. We observe the absence of a
+        // link within a short window; the dialer then sleeps in backoff (detached, mirroring production
+        // where the endpoint keeps serving its origin while mesh reachability is down).
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        std::thread::spawn(move || dial_relay("ws://127.0.0.1:1/".to_string(), ev_tx));
+        // Nothing should come up: the relay is refused, so the error branch runs and backs off.
+        assert!(
+            matches!(
+                ev_rx.recv_timeout(Duration::from_millis(500)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "an unreachable relay never surfaces a link (it degrades and backs off)"
+        );
+    }
+
+    // ---- build_endpoint: origin/domain normalization + leaf-node configuration ------------------
+
+    #[test]
+    fn build_endpoint_normalizes_origin_and_domain_and_builds_a_leaf_node() {
+        // The operator's --origin/--domain are normalized before use: the origin loses a trailing '/'
+        // (so requests are exactly `<origin><path>`), and the domain is lowercased with any trailing
+        // dot stripped (so the case-insensitive host binding compares cleanly). The node is built as an
+        // Endpoint leaf (it never relays others' bundles) named for the domain.
+        let identity = Identity::generate();
+        let expected_addr = identity.address();
+        let (node, origin, domain) = build_endpoint(
+            "http://backend:8080/".to_string(),
+            "Example.HopMe.SH.".to_string(),
+            identity,
+            "0.0.0.0:9444",
+        );
+        assert_eq!(
+            origin, "http://backend:8080",
+            "a trailing slash is stripped"
+        );
+        assert_eq!(
+            domain, "example.hopme.sh",
+            "the domain is lowercased with the trailing dot removed"
+        );
+        assert_eq!(
+            node.address(),
+            expected_addr,
+            "the node keeps the supplied identity's address (published in DNS)"
+        );
+    }
+
+    // ---- read_request_head: the empty/EOF/read-error edges -------------------------------------
+
+    #[test]
+    fn read_request_head_returns_none_on_an_empty_reader() {
+        // No bytes at all (a bare TCP probe that sends nothing) => None, so the proxy serves nothing.
+        use std::io::Cursor;
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()).take(MAX_REQ_HEAD_BYTES));
+        assert!(
+            read_request_head(&mut reader).is_none(),
+            "an empty read yields no request head"
+        );
+    }
+
+    #[test]
+    fn read_request_head_serves_complete_lines_then_eof_without_a_blank_line() {
+        // A client that sends a complete request line + header then closes (EOF at a line boundary, no
+        // terminating blank line) is served leniently from the complete lines already read. A non-XFF
+        // header is skipped; the method/path are parsed.
+        use std::io::Cursor;
+        let raw = b"GET /page HTTP/1.1\r\nHost: example\r\n".to_vec(); // no trailing blank line
+        let mut reader = BufReader::new(Cursor::new(raw).take(MAX_REQ_HEAD_BYTES));
+        let head = read_request_head(&mut reader).expect("complete lines are served on EOF");
+        assert!(head.method.eq_ignore_ascii_case("GET"));
+        assert_eq!(head.raw_path, "/page");
+        assert!(head.xff.is_none(), "no X-Forwarded-For present");
+    }
+
+    /// A reader that emits its buffered bytes once, then fails every subsequent read. Wrapped in a
+    /// BufReader it lets `read_request_head` parse the request line, then errors while draining
+    /// headers, exercising the read-error branch of the header loop.
+    struct FailingReader {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = std::io::Read::read(&mut self.data, buf)?;
+            if n == 0 {
+                return Err(std::io::Error::other("boom"));
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_request_head_stops_gracefully_on_a_header_read_error() {
+        // A read error while draining headers must not panic: we stop and serve what we parsed (the
+        // request line). Models a socket that faults after delivering the request line.
+        let reader = FailingReader {
+            data: std::io::Cursor::new(b"GET /x HTTP/1.1\r\n".to_vec()),
+        };
+        let mut reader = BufReader::new(reader);
+        let head = read_request_head(&mut reader).expect("the request line still parses");
+        assert!(head.method.eq_ignore_ascii_case("GET"));
+        assert_eq!(head.raw_path, "/x");
+    }
+
+    // ---- serve_http_proxy: the max_resp truncation on the plain-HTTP path -----------------------
+
+    #[test]
+    fn http_proxy_truncates_a_body_over_max_resp() {
+        // The plain-HTTP reverse proxy applies the same hard body cap as the hops:// path, so a huge
+        // origin response can't blow memory. Point it at a stub returning 5000 bytes with max_resp=100.
+        let (origin, _rx) = stub_origin(1, "200 OK", "application/octet-stream", vec![9u8; 5000]);
+        let resp = drive_proxy(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n", &origin, 100);
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "status passes through: {resp}"
+        );
+        assert!(
+            resp.contains("Content-Length: 100"),
+            "the body is truncated to the max_resp cap: {resp}"
+        );
+    }
+
+    // ---- allow_source: the map sweep once the tracked-source set grows large --------------------
+
+    #[test]
+    fn allow_source_sweeps_the_map_once_it_grows_past_the_threshold() {
+        // The per-source map is swept of expired windows once it exceeds RATE_MAP_SWEEP_AT so it can't
+        // grow without bound. Insert more than the threshold of distinct sources to trip the sweep; all
+        // are fresh (< the window) so every source is retained and still admitted.
+        use std::net::Ipv4Addr;
+        // Distinct, high addresses that won't collide with the small fixed IPs other tests use.
+        let n = (RATE_MAP_SWEEP_AT as u32) + 2;
+        let mut admitted = true;
+        for i in 0..n {
+            let ip = IpAddr::V4(Ipv4Addr::from(0xB000_0000u32 + i));
+            admitted &= allow_source(ip);
+        }
+        assert!(
+            admitted,
+            "fresh distinct sources are all admitted (and the sweep retains them)"
+        );
+    }
+
+    // ---- load_identity: the persist-failure warning path ---------------------------------------
+
+    #[test]
+    fn load_identity_still_returns_an_identity_when_persistence_fails() {
+        // If the seed can't be persisted (e.g. an unwritable path), load_identity logs a warning and
+        // still returns a usable (ephemeral) identity rather than aborting startup.
+        let bad = format!(
+            "{}/hop-endpoint-nodir-{}/id.key", // parent dir does not exist -> create fails
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let id = load_identity(&Some(bad));
+        assert_eq!(
+            id.address().len(),
+            32,
+            "an identity is returned even when the seed cannot be persisted"
+        );
+    }
+
+    // ---- serve_conn: the plain-HTTP route, empty/invalid handshakes, writer teardown ------------
+
+    fn spawn_serve_conn(
+        origin: &'static str,
+        max_resp: u32,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::Receiver<Ev>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let http = test_client();
+        let h = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_conn(sock, &ev_tx, origin, &http, max_resp);
+        });
+        (addr, ev_rx, h)
+    }
+
+    #[test]
+    fn serve_conn_routes_a_plain_http_request_to_the_reverse_proxy() {
+        // serve_conn peeks, sees no WS upgrade, and hands a plain HTTP request to the reverse proxy.
+        // /healthz answers 200 without touching the (dead) origin, proving the proxy branch ran.
+        let (addr, ev_rx, h) = spawn_serve_conn("http://127.0.0.1:1", 1024);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "proxied healthz: {resp}"
+        );
+        // The proxy path never surfaces a bearer link.
+        assert!(
+            ev_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a plain HTTP request produces no bearer Ev::Up"
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn serve_conn_returns_on_a_bare_probe_without_serving() {
+        // A connection that opens and closes with no bytes classifies Empty; serve_conn returns without
+        // surfacing a link or hanging.
+        let (addr, ev_rx, h) = spawn_serve_conn("http://127.0.0.1:1", 1024);
+        let client = TcpStream::connect(addr).unwrap();
+        drop(client); // send nothing, close
+        assert!(
+            ev_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a bare probe surfaces no events"
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn serve_conn_returns_when_the_websocket_handshake_is_invalid() {
+        // A request whose head carries the upgrade token but is not a valid WS handshake (no
+        // Sec-WebSocket-Key) is classified WsUpgrade, then tungstenite::accept rejects it and serve_conn
+        // returns without ever surfacing Ev::Up.
+        let (addr, ev_rx, h) = spawn_serve_conn("http://127.0.0.1:1", 1024);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .unwrap();
+        // The handshake is rejected; the server closes without surfacing a link.
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 512];
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&buf[..n]);
+        }
+        assert!(
+            ev_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "an invalid WS handshake surfaces no Ev::Up"
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn serve_conn_tears_down_the_link_when_its_writer_is_dropped() {
+        // Dropping the link's writer (out_tx, carried on Ev::Up) makes serve_conn's out_rx see a
+        // Disconnected on the next loop and break the connection, reporting Ev::Down. This is the path
+        // the driver uses to close a link (it drops the writer when the link goes away).
+        use tungstenite::connect;
+        let (addr, ev_rx, h) = spawn_serve_conn("http://127.0.0.1:1", 1024);
+        let (mut ws, _resp) = connect(format!("ws://{addr}/")).expect("WS handshake");
+        let out = match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Up(_l, _role, out) => out,
+            other => panic!("expected Ev::Up, got {other:?}"),
+        };
+        drop(out); // the driver dropped this link's writer
+        match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Down(_l) => {}
+            other => panic!("expected Ev::Down after the writer is dropped, got {other:?}"),
+        }
+        let _ = ws.close(None);
+        while ws.read().is_ok() {}
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn serve_conn_ignores_non_binary_control_and_text_frames() {
+        // Only Binary frames carry Hop link packets; a Text (or control) frame is ignored (no Ev::Data)
+        // and the link stays up until close. Proves the Ok(_) arm of the read loop.
+        use tungstenite::connect;
+        let (addr, ev_rx, h) = spawn_serve_conn("http://127.0.0.1:1", 1024);
+        let (mut ws, _resp) = connect(format!("ws://{addr}/")).expect("WS handshake");
+        // Hold the writer alive so serve_conn tears down via the Close frame (reading + ignoring the
+        // Text frame first), not via an early out_rx Disconnected from a dropped writer.
+        let out = match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Up(_l, _r, out) => out,
+            other => panic!("expected Ev::Up, got {other:?}"),
+        };
+        ws.send(Message::Text("not a hop packet".into())).unwrap();
+        ws.flush().unwrap();
+        // A Text frame yields no Ev::Data; the next event we expect is Down after we close.
+        ws.close(None).unwrap();
+        let _ = ws.flush();
+        while ws.read().is_ok() {}
+        match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Ev::Down(_l) => {}
+            Ev::Data(_l, _b) => panic!("a non-binary frame must not surface Ev::Data"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        drop(out);
+        h.join().unwrap();
+    }
+
+    // ---- peek_kind: the buffer-full guess and the stalled-peer timeout --------------------------
+
+    #[test]
+    fn peek_kind_guesses_http_proxy_when_the_peek_buffer_fills_undecided() {
+        // A client that streams more than the 2 KiB peek buffer with no end-of-headers marker and no
+        // upgrade token fills the buffer while still undecided; peek_kind stops peeking and falls back
+        // to HttpProxy (the proxy re-reads and handles/sheds it).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            peek_kind(&sock)
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        // > 2048 bytes, no CRLFCRLF, no upgrade token: undecidable, buffer fills.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"GET /");
+        blob.resize(4096, b'a');
+        client.write_all(&blob).unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            PeekKind::HttpProxy,
+            "a full buffer with no decision falls back to HttpProxy"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn peek_kind_reports_empty_when_the_peer_connects_but_stalls() {
+        // A peer that connects and holds the socket open without sending anything must not hang the
+        // handler: the peek times out on the first attempt with no bytes and classifies Empty.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // A short read timeout so the first peek returns TimedOut quickly (no data sent).
+            sock.set_read_timeout(Some(Duration::from_millis(80))).ok();
+            peek_kind(&sock)
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        // Hold the connection open (send nothing) long enough for the peek to time out, then close.
+        let kind = server.join().unwrap();
+        drop(client);
+        assert_eq!(
+            kind,
+            PeekKind::Empty,
+            "a connected-but-silent peer times out to Empty rather than hanging"
+        );
+    }
+
+    // ---- ConnGuard / FetchGuard: the counters decrement on drop (incl. panic unwind) ------------
+
+    #[test]
+    fn conn_guard_decrements_active_conns_on_drop() {
+        // The accept loop bumps ACTIVE_CONNS and relies on ConnGuard::drop to release the slot when the
+        // handler thread finishes (or unwinds). Prove the Drop decrements. Uses the global counter,
+        // which no other test mutates, and restores it to its starting value.
+        let before = ACTIVE_CONNS.load(Ordering::SeqCst);
+        ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst);
+        {
+            let _g = ConnGuard; // dropped at the end of this scope -> fetch_sub(1)
+        }
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            before,
+            "ConnGuard::drop released the connection slot"
+        );
+    }
+
+    #[test]
+    fn fetch_guard_decrements_inflight_fetches_on_drop() {
+        // The fetch worker bumps INFLIGHT_FETCHES and relies on FetchGuard::drop to release the slot.
+        let before = INFLIGHT_FETCHES.load(Ordering::SeqCst);
+        INFLIGHT_FETCHES.fetch_add(1, Ordering::SeqCst);
+        {
+            let _g = FetchGuard; // dropped here -> fetch_sub(1)
+        }
+        assert_eq!(
+            INFLIGHT_FETCHES.load(Ordering::SeqCst),
+            before,
+            "FetchGuard::drop released the in-flight fetch slot"
+        );
+    }
+
+    // ---- read_request_head: request-line and truncated-header-line edges ------------------------
+
+    #[test]
+    fn read_request_head_rejects_a_request_line_with_no_newline() {
+        // A request line that arrives without a terminating newline (the byte cap truncated it) is
+        // rejected rather than parsed as a partial target.
+        use std::io::Cursor;
+        let mut reader = BufReader::new(Cursor::new(b"GET /no-newline".to_vec()).take(64));
+        assert!(
+            read_request_head(&mut reader).is_none(),
+            "a request line with no newline is shed"
+        );
+    }
+
+    #[test]
+    fn read_request_head_rejects_a_truncated_header_line() {
+        // A header line with no terminator (the cap landed mid-header) is an oversized/hostile head and
+        // is shed, not parsed as a partial header.
+        use std::io::Cursor;
+        // Complete request line, then a header that never terminates within the cap.
+        let mut raw = b"GET / HTTP/1.1\r\nX-Long: ".to_vec();
+        raw.resize(raw.len() + 200, b'z'); // no CRLF
+        let mut reader = BufReader::new(Cursor::new(raw).take(64));
+        assert!(
+            read_request_head(&mut reader).is_none(),
+            "a header line truncated by the cap is shed"
+        );
+    }
+
+    #[test]
+    fn read_request_head_captures_x_forwarded_for() {
+        // The X-Forwarded-For header is captured (keyed on the trusted last hop) for the per-client
+        // rate limit; other headers are drained and ignored.
+        use std::io::Cursor;
+        let raw =
+            b"GET /p HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 1.1.1.1, 2.2.2.2\r\nAccept: */*\r\n\r\n"
+                .to_vec();
+        let mut reader = BufReader::new(Cursor::new(raw).take(MAX_REQ_HEAD_BYTES));
+        let head = read_request_head(&mut reader).expect("a well-formed head parses");
+        assert_eq!(head.raw_path, "/p");
+        assert_eq!(
+            head.xff.as_deref(),
+            Some("2.2.2.2"),
+            "the last (trusted) XFF hop is captured"
         );
     }
 }
