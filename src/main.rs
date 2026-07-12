@@ -476,7 +476,7 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                         match out_rx.try_recv() {
                             Ok(bytes) => {
                                 wrote = true;
-                                match ws.write(Message::Binary(bytes)) {
+                                match ws.write(Message::Binary(bytes.into())) {
                                     Ok(()) => {}
                                     Err(tungstenite::Error::Io(e))
                                         if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -994,11 +994,9 @@ fn peek_kind(stream: &TcpStream) -> PeekKind {
 /// must buffer (the relay enforces the identical cap on its WS bearer, services-05). Extracted so the
 /// cap is unit-testable and can't silently drift back to the default (`ws_bearer_config_rejects_...`).
 fn bearer_ws_config() -> tungstenite::protocol::WebSocketConfig {
-    tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(MAX_FRAME_BYTES),
-        max_frame_size: Some(MAX_FRAME_BYTES),
-        ..Default::default()
-    }
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
 }
 
 /// Handle one inbound connection: a WebSocket becomes a Hop link (hops:// bearer); anything
@@ -1049,7 +1047,7 @@ fn serve_conn(
         loop {
             match out_rx.try_recv() {
                 Ok(bytes) => {
-                    if ws.write(Message::Binary(bytes)).is_err() {
+                    if ws.write(Message::Binary(bytes.into())).is_err() {
                         break 'conn;
                     }
                 }
@@ -2077,7 +2075,7 @@ mod tests {
         };
 
         // Client -> endpoint: a Binary frame surfaces as Ev::Data with the exact bytes.
-        ws.send(Message::Binary(vec![1, 2, 3, 4])).unwrap();
+        ws.send(Message::Binary(vec![1, 2, 3, 4].into())).unwrap();
         ws.flush().unwrap();
         match ev_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
             Ev::Data(_link, bytes) => {
@@ -2143,10 +2141,10 @@ mod tests {
 
         let url = format!("ws://{addr}/");
         let (mut ws, _resp) = connect(&url).expect("client WS handshake completes");
-        ws.send(Message::Binary(vec![1, 2, 3, 4])).unwrap();
+        ws.send(Message::Binary(vec![1, 2, 3, 4].into())).unwrap();
         ws.flush().unwrap();
         // Over the cap by one byte: the client (default config) sends it; the capped server rejects it.
-        let _ = ws.send(Message::Binary(vec![0xABu8; MAX_FRAME_BYTES + 1]));
+        let _ = ws.send(Message::Binary(vec![0xABu8; MAX_FRAME_BYTES + 1].into()));
         let _ = ws.flush();
         let _ = ws.close(None);
 
@@ -2289,7 +2287,7 @@ mod tests {
             // Keep an open, actively-flowing connection so the endpoint can never observe a closed
             // socket before it has drained a data frame. Re-send until the test says stop.
             while !stop_srv.load(Ordering::Relaxed) {
-                if ws.send(Message::Binary(vec![5, 6, 7])).is_err() {
+                if ws.send(Message::Binary(vec![5, 6, 7].into())).is_err() {
                     break;
                 }
                 if ws.flush().is_err() {

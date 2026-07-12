@@ -12,6 +12,6 @@ hop-core.workspace = true
 # gateway and endpoint cannot drift. Default (lib-only) features — no reqwest/tungstenite pulled in.
 hop-gateway = { path = "../hop-gateway" }
 # rustls feature so the endpoint can DIAL a relay over wss:// (be routable on the mesh, §30).
-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 bs58 = "0.5"
