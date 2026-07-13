@@ -348,12 +348,17 @@ fn main() {
     let identity = load_identity(&identity_file);
     // Normalize origin/domain and configure the leaf endpoint node bound to that domain (extracted
     // so the normalization + node setup is unit-testable; main keeps the socket/thread orchestration).
-    let (node, origin, domain) = build_endpoint(origin, domain, identity, &listen);
+    let (mut node, origin, domain) = build_endpoint(origin, domain, identity, &listen);
 
     // Publish this endpoint's HNS reach record at /.well-known/hop (§30): a client resolves the domain
     // by fetching it (its TLS cert proves the domain; the signed record self-certifies the address).
     // Sign the initial body BEFORE the accept loop starts so a well-known GET never races an empty
     // body; the driver loop refreshes it (WELL_KNOWN_RESIGN) so it never expires.
+    // PRIME THE NODE CLOCK FIRST: sign_reach_record stamps issued_at from node.now_ms, which is 0 until
+    // the first tick. Signing pre-tick would mint a record with issued_at=0 that is already expired
+    // (issued_at + ttl << now), so every fresh resolution in the first WELL_KNOWN_RESIGN window would
+    // fail verification. One tick sets the clock to real wall time.
+    node.tick(now_ms());
     *well_known_body().lock().expect("well-known lock") =
         sign_well_known(&node, &public_url_for(&domain));
 
@@ -1429,7 +1434,11 @@ mod tests {
         // touching the origin (point at a dead port). The served `reach` field must verify in core as a
         // self-certifying binding of the endpoint's own address, proving a client can resolve it.
         use base64::Engine as _;
-        let node = Node::new(Identity::generate());
+        let mut node = Node::new(Identity::generate());
+        // Prime the node clock exactly as main() does: sign_reach_record stamps issued_at from now_ms,
+        // so an un-ticked node would mint issued_at=0 and the record would be born expired. Ticking here
+        // (and verifying WITH the expiry check below) is what makes this test catch that regression.
+        node.tick(now_ms());
         let addr = node.address();
         *well_known_body().lock().unwrap() = sign_well_known(&node, "wss://example.hopme.sh/");
 
@@ -1457,13 +1466,20 @@ mod tests {
         let record = base64::engine::general_purpose::STANDARD
             .decode(reach_b64)
             .expect("reach is base64");
-        let rec = hop_core::reach::ReachRecord::verify(&record, None)
-            .expect("the served reach record verifies (self-certifying)");
+        // Verify WITH the expiry check (Some(now)), not None: a record signed by an un-ticked node has
+        // issued_at=0 and is already expired, so this is the assertion that catches the born-expired bug.
+        let now = now_ms() / 1000;
+        let rec = hop_core::reach::ReachRecord::verify(&record, Some(now))
+            .expect("the served reach record verifies AND is unexpired");
         assert_eq!(
             rec.claim.address, addr,
             "the record certifies THIS endpoint's address"
         );
         assert_eq!(rec.claim.endpoint, "wss://example.hopme.sh/");
+        assert!(
+            rec.claim.issued_at > 0,
+            "issued_at must be real wall time, not 0"
+        );
     }
 
     #[test]
