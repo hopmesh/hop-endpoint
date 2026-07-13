@@ -6,9 +6,11 @@
 //! an HTTP translator **bound to one origin**: a `hops://` request carries only a path, and
 //! the endpoint executes it against its *own* configured backend. It is never an open proxy.
 //!
-//! The operator publishes `_hopaddress.<domain>  TXT  <printed-address>` (HNS) and fronts
-//! `--listen` with TLS (the LB terminates `wss://<domain>:9444/` → plain `ws` here), exactly
-//! like the relay fleet.
+//! The endpoint publishes its own HNS binding: it serves a signed reach record at
+//! `https://<domain>/.well-known/hop` (§30), so a client resolves the domain by fetching that (the
+//! TLS cert proves the domain; the record self-certifies the address). The operator just fronts
+//! `--listen` with TLS (the LB terminates `wss://<domain>:9444/` to plain `ws` here, and routes the
+//! well-known GET to this same HTTP server), exactly like the relay fleet.
 //!
 //! Usage:
 //!   hop-endpoint --listen 0.0.0.0:9444 --domain example.hopme.sh \
@@ -32,10 +34,45 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use hop_core::prelude::*;
 use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
+
+/// HNS reach-record TTL (DESIGN.md §30): how long a client caches this endpoint's `domain -> address`
+/// binding after fetching `/.well-known/hop`. We RE-sign well within it ([`WELL_KNOWN_RESIGN`]) so the
+/// served record is always fresh even under a long-lived process.
+const WELL_KNOWN_TTL_SECS: u32 = 7200; // 2h
+/// How often the driver loop re-signs the well-known body, comfortably under [`WELL_KNOWN_TTL_SECS`].
+const WELL_KNOWN_RESIGN: Duration = Duration::from_secs(3600); // 1h
+
+/// The pre-signed `/.well-known/hop` body (JSON `{address, endpoint, reach}`, the same shape every
+/// endpoint SDK serves). Process-global because an endpoint is bound to exactly one domain/identity, so
+/// there is one record. Empty until the driver first signs it (a probe before then just 404s); the
+/// driver refreshes it under a Mutex so a long-lived process never serves an expired record.
+fn well_known_body() -> &'static Mutex<Vec<u8>> {
+    static WK: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    WK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Sign this endpoint's reach record for `public_url` and render the `/.well-known/hop` JSON body.
+/// The `reach` field is the base64-std postcard record (drivers decode exactly this); `address` +
+/// `endpoint` are informational, matching the SDK discovery format. All three values are base58 /
+/// base64 / a bare wss URL, so the JSON is safe to build by hand (no embedded quotes to escape).
+fn sign_well_known(node: &Node, public_url: &str) -> Vec<u8> {
+    let rec = node.sign_reach_record(public_url.to_string(), WELL_KNOWN_TTL_SECS);
+    let reach = base64::engine::general_purpose::STANDARD.encode(rec.to_bytes());
+    let address = bs58::encode(node.address()).into_string();
+    format!("{{\"address\":\"{address}\",\"endpoint\":\"{public_url}\",\"reach\":\"{reach}\"}}")
+        .into_bytes()
+}
+
+/// The direct-dial URL a client reaches this endpoint at (the reach record's `endpoint` field), the
+/// LB-fronted `wss://<domain>/` that `serve_conn` upgrades to a Hop bearer link.
+fn public_url_for(domain: &str) -> String {
+    format!("wss://{domain}/")
+}
 
 /// services-r7-02: cap on a single inbound WS bearer message/frame, mirroring relayd's services-05
 /// `MAX_FRAME_BYTES`. The hops:// WS bearer accepts frames from ANY mesh peer that dials this public
@@ -235,8 +272,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> CliConfig {
                 relay = None; // run isolated (listening only), e.g. for local tests
                 relay_cli_set = true;
             }
-            // Load the identity, print its base58 address, and exit. Used to fill in the
-            // `_hopaddress.<domain>` TXT record before the endpoint ever serves traffic.
+            // Load the identity, print its base58 address, and exit. Useful for pinning the
+            // endpoint's published address in config/docs (the endpoint serves it itself via
+            // /.well-known/hop, so no DNS record needs it).
             "--print-address" => print_address = true,
             other => eprintln!("ignoring unknown arg: {other}"),
         }
@@ -311,6 +349,13 @@ fn main() {
     // Normalize origin/domain and configure the leaf endpoint node bound to that domain (extracted
     // so the normalization + node setup is unit-testable; main keeps the socket/thread orchestration).
     let (node, origin, domain) = build_endpoint(origin, domain, identity, &listen);
+
+    // Publish this endpoint's HNS reach record at /.well-known/hop (§30): a client resolves the domain
+    // by fetching it (its TLS cert proves the domain; the signed record self-certifies the address).
+    // Sign the initial body BEFORE the accept loop starts so a well-known GET never races an empty
+    // body; the driver loop refreshes it (WELL_KNOWN_RESIGN) so it never expires.
+    *well_known_body().lock().expect("well-known lock") =
+        sign_well_known(&node, &public_url_for(&domain));
 
     // Redirects are disabled: the backend can never bounce us to a different host.
     let http = reqwest::blocking::Client::builder()
@@ -405,11 +450,11 @@ fn build_endpoint(
     println!("hop-endpoint: authorized domain {domain}  (rejects any other host)");
     println!("hop-endpoint: serving origin {origin}");
     println!(
-        "hop-endpoint: publish DNS →  _hopaddress.{domain}  TXT  \"{}\"",
+        "hop-endpoint: HNS reach record served at https://{domain}/.well-known/hop  (address {})",
         bs58::encode(addr).into_string()
     );
     println!(
-        "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin)"
+        "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin + /.well-known/hop)"
     );
     (node, origin, domain)
 }
@@ -551,6 +596,11 @@ fn run(
     rx: mpsc::Receiver<Ev>,
 ) {
     let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+    // Refresh the /.well-known/hop reach record before it expires (§30). Signed once in `main` before
+    // the accept loop starts; re-signed here every WELL_KNOWN_RESIGN so a long-lived process never
+    // serves an expired record.
+    let public_url = public_url_for(&domain);
+    let mut last_wk = Instant::now();
     loop {
         // services-r3-04: the accept threads wrap serve_conn in catch_unwind so one malformed request
         // can't tear down the process, but the driver's own parse/handle ran unguarded on this thread.
@@ -593,6 +643,13 @@ fn run(
             }
             Err(RecvTimeoutError::Timeout) => {
                 guard_core("tick", || node.tick(now_ms()));
+                // Re-sign the well-known reach record so its expiry always stays in the future.
+                if last_wk.elapsed() >= WELL_KNOWN_RESIGN {
+                    if let Ok(mut wk) = well_known_body().lock() {
+                        *wk = sign_well_known(&node, &public_url);
+                    }
+                    last_wk = Instant::now();
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -852,6 +909,34 @@ fn serve_http_proxy(
         );
         let _ = stream.write_all(header.as_bytes());
         let _ = stream.write_all(body);
+        let _ = stream.flush();
+        return;
+    }
+
+    // HNS discovery (DESIGN.md §30): serve this endpoint's signed reach record so a client can resolve
+    // the domain -> Hop address. The TLS cert on this fetch proves the domain; the record self-certifies
+    // the address. Never proxied to the origin. Empty body = not signed yet (startup race) -> 404.
+    if method.eq_ignore_ascii_case("GET") && path_only == "/.well-known/hop" {
+        let body = well_known_body()
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        let (code, ctype, payload): (&str, &str, Vec<u8>) = if body.is_empty() {
+            (
+                "404 Not Found",
+                "text/plain",
+                b"hop-endpoint: reach record not ready".to_vec(),
+            )
+        } else {
+            ("200 OK", "application/json", body)
+        };
+        let header = format!(
+            "HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            payload.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&payload);
         let _ = stream.flush();
         return;
     }
@@ -1336,6 +1421,49 @@ mod tests {
             resp.trim_end().ends_with("ok"),
             "healthz body is ok: {resp}"
         );
+    }
+
+    #[test]
+    fn http_proxy_serves_the_signed_well_known_reach_record() {
+        // §30: GET /.well-known/hop returns THIS endpoint's signed reach record as JSON, without ever
+        // touching the origin (point at a dead port). The served `reach` field must verify in core as a
+        // self-certifying binding of the endpoint's own address, proving a client can resolve it.
+        use base64::Engine as _;
+        let node = Node::new(Identity::generate());
+        let addr = node.address();
+        *well_known_body().lock().unwrap() = sign_well_known(&node, "wss://example.hopme.sh/");
+
+        let resp = drive_proxy(
+            b"GET /.well-known/hop HTTP/1.1\r\nHost: x\r\n\r\n",
+            "http://127.0.0.1:1",
+            4096,
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "well-known => 200: {resp}"
+        );
+        assert!(
+            resp.contains("Content-Type: application/json"),
+            "served as JSON: {resp}"
+        );
+
+        // Pull the JSON body, extract the base64 `reach` field, and verify the record in core.
+        let json = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let reach_b64 = json
+            .split("\"reach\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("reach field present");
+        let record = base64::engine::general_purpose::STANDARD
+            .decode(reach_b64)
+            .expect("reach is base64");
+        let rec = hop_core::reach::ReachRecord::verify(&record, None)
+            .expect("the served reach record verifies (self-certifying)");
+        assert_eq!(
+            rec.claim.address, addr,
+            "the record certifies THIS endpoint's address"
+        );
+        assert_eq!(rec.claim.endpoint, "wss://example.hopme.sh/");
     }
 
     #[test]
