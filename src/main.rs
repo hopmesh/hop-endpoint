@@ -475,6 +475,15 @@ fn build_endpoint(
             println!(
                 "hop-endpoint: clustering ON (HOP_CLUSTER_SECRET set); replicas dedup shared work over the mesh"
             );
+            // Optional hold-until-coordinated (CP, DESIGN.md §40 P3): set HOP_CLUSTER_QUORUM to a
+            // MAJORITY of the replica count so a partition minority holds instead of double-processing.
+            if let Some(q) = std::env::var("HOP_CLUSTER_QUORUM")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                node.cluster_quorum(q as usize);
+                println!("hop-endpoint: quorum = {q} (hold-until-coordinated; a minority partition waits)");
+            }
         }
     }
     (node, origin, domain)
