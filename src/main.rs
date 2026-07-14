@@ -36,6 +36,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hop_core::prelude::*;
+use hop_endpoint_core::Endpoint;
+
+/// This origin endpoint runs on an in-memory node, wrapped as an [`Endpoint`] so multiple replicas
+/// (same identity, no shared datastore) can cluster and each proxy a given request once. Clustering
+/// is off unless `HOP_CLUSTER_SECRET` is set; every replica must set the same value.
+type Ep = Endpoint<hop_core::store::MemoryStore>;
 use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
@@ -60,7 +66,7 @@ fn well_known_body() -> &'static Mutex<Vec<u8>> {
 /// The `reach` field is the base64-std postcard record (drivers decode exactly this); `address` +
 /// `endpoint` are informational, matching the SDK discovery format. All three values are base58 /
 /// base64 / a bare wss URL, so the JSON is safe to build by hand (no embedded quotes to escape).
-fn sign_well_known(node: &Node, public_url: &str) -> Vec<u8> {
+fn sign_well_known(node: &Ep, public_url: &str) -> Vec<u8> {
     let rec = node.sign_reach_record(public_url.to_string(), WELL_KNOWN_TTL_SECS);
     let reach = base64::engine::general_purpose::STANDARD.encode(rec.to_bytes());
     let address = bs58::encode(node.address()).into_string();
@@ -435,7 +441,7 @@ fn build_endpoint(
     domain: String,
     identity: Identity,
     listen: &str,
-) -> (Node, String, String) {
+) -> (Ep, String, String) {
     // Bind to a single origin: scheme://host[:port], no trailing slash. Requests only ever get this
     // prefix + their path - never an arbitrary host (no open proxy).
     let origin = origin.trim_end_matches('/').to_string();
@@ -443,7 +449,7 @@ fn build_endpoint(
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
 
     let addr = identity.address();
-    let mut node = Node::new(identity);
+    let mut node = Endpoint::new(Node::new(identity));
     // Answer hop.identify as the domain we back (DESIGN.md §29/§30), so a peer that resolves or
     // traces this address sees `example.hopme.sh`, not a bare short address.
     node.set_kind(NodeKind::Endpoint);
@@ -461,6 +467,16 @@ fn build_endpoint(
     println!(
         "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin + /.well-known/hop)"
     );
+    // Cluster with sibling replicas if configured: every replica set to the same HOP_CLUSTER_SECRET
+    // joins the same cluster and each proxies a given request once (DESIGN.md §40).
+    if let Ok(pass) = std::env::var("HOP_CLUSTER_SECRET") {
+        if !pass.is_empty() {
+            node.cluster_join_passphrase(pass.as_bytes());
+            println!(
+                "hop-endpoint: clustering ON (HOP_CLUSTER_SECRET set); replicas dedup shared work over the mesh"
+            );
+        }
+    }
     (node, origin, domain)
 }
 
@@ -592,7 +608,7 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
 /// The driver: sole owner of the node. Routes outgoing bytes to per-link writers, and on a
 /// `hops` request spawns a worker to fetch the origin, replying when it returns.
 fn run(
-    mut node: Node,
+    mut node: Ep,
     domain: String,
     origin: String,
     http: reqwest::blocking::Client,
@@ -1434,7 +1450,7 @@ mod tests {
         // touching the origin (point at a dead port). The served `reach` field must verify in core as a
         // self-certifying binding of the endpoint's own address, proving a client can resolve it.
         use base64::Engine as _;
-        let mut node = Node::new(Identity::generate());
+        let mut node = Endpoint::new(Node::new(Identity::generate()));
         // Prime the node clock exactly as main() does: sign_reach_record stamps issued_at from now_ms,
         // so an un-ticked node would mint issued_at=0 and the record would be born expired. Ticking here
         // (and verifying WITH the expiry check below) is what makes this test catch that regression.
@@ -2369,7 +2385,7 @@ mod tests {
         // dispatch without tearing the loop down. The loop owns a tx clone so it never sees Disconnect;
         // we assert the observable msg1 routing, then let the daemon thread go (it can't be stopped from
         // outside by design, mirroring the always-on production loop).
-        let node = Node::new(Identity::generate());
+        let node = Endpoint::new(Node::new(Identity::generate()));
         let (tx, rx) = mpsc::channel::<Ev>();
         let driver_tx = tx.clone();
         let http = test_client();
