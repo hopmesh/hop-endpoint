@@ -39,8 +39,9 @@ use hop_core::prelude::*;
 use hop_endpoint_core::Endpoint;
 
 /// This origin endpoint runs on an in-memory node, wrapped as an [`Endpoint`] so multiple replicas
-/// (same identity, no shared datastore) can cluster and each proxy a given request once. Clustering
-/// is off unless `HOP_CLUSTER_SECRET` is set; every replica must set the same value.
+/// (same identity, no shared datastore) can cluster and reduce duplicate request processing through
+/// TTL-based membership and handled-message gossip. Clustering is off unless `HOP_CLUSTER_SECRET`
+/// is set; every replica must set the same value.
 type Ep = Endpoint<hop_core::store::MemoryStore>;
 use tungstenite::Message;
 
@@ -468,21 +469,24 @@ fn build_endpoint(
         "hop-endpoint: listening on {listen} (ws = hops:// bearer, http = reverse-proxy to origin + /.well-known/hop)"
     );
     // Cluster with sibling replicas if configured: every replica set to the same HOP_CLUSTER_SECRET
-    // joins the same cluster and each proxies a given request once (DESIGN.md §40).
+    // joins the same TTL-based membership view and gossips handled requests (DESIGN.md §40).
     if let Ok(pass) = std::env::var("HOP_CLUSTER_SECRET") {
         if !pass.is_empty() {
             node.cluster_join_passphrase(pass.as_bytes());
             println!(
-                "hop-endpoint: clustering ON (HOP_CLUSTER_SECRET set); replicas dedup shared work over the mesh"
+                "hop-endpoint: clustering ON (HOP_CLUSTER_SECRET set); replicas coordinate duplicate work with TTL-based membership and handled gossip"
             );
-            // Optional hold-until-coordinated (CP, DESIGN.md §40 P3): set HOP_CLUSTER_QUORUM to a
-            // MAJORITY of the replica count so a partition minority holds instead of double-processing.
+            // Optional visibility threshold (DESIGN.md §40 P3): require this many members to have
+            // beaconed within the membership TTL before processing. This is not consensus or a
+            // partition-safe quorum: replicas can temporarily hold different overlapping views.
             if let Some(q) = std::env::var("HOP_CLUSTER_QUORUM")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
             {
                 node.cluster_quorum(q as usize);
-                println!("hop-endpoint: quorum = {q} (hold-until-coordinated; a minority partition waits)");
+                println!(
+                    "hop-endpoint: cluster visibility threshold = {q} recently observed members (TTL-based; not partition-safe consensus)"
+                );
             }
         }
     }
@@ -788,7 +792,7 @@ fn fetch(
     let url = format!("{origin}{path}");
     // Tell the origin this request arrived over the mesh, so it can word itself accordingly.
     match http.get(&url).header("x-hop-scheme", "hops").send() {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = resp.status().as_u16();
             let ctype = resp
                 .headers()
@@ -796,14 +800,21 @@ fn fetch(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            let mut body = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
-            if body.len() > max_resp as usize {
-                body.truncate(max_resp as usize);
-            }
+            let body = read_response_body(&mut resp, max_resp).unwrap_or_default();
             (status, ctype, body)
         }
         Err(_) => (502, plain, b"hop-endpoint: backend unreachable".to_vec()),
     }
+}
+
+/// Read at most the protocol-negotiated response allowance from an origin stream.
+///
+/// `Read::take` is important here: truncating after `Response::bytes()` would first buffer an
+/// untrusted response in full, allowing a large or endless backend body to exhaust endpoint memory.
+fn read_response_body(reader: &mut impl Read, max_resp: u32) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    reader.take(u64::from(max_resp)).read_to_end(&mut body)?;
+    Ok(body)
 }
 
 /// Reduce a request target to a path+query, discarding any scheme/host a client may have
@@ -1002,7 +1013,7 @@ fn serve_http_proxy(
         let url = format!("{origin}{path_only}");
         // The LB terminated TLS for us; tell the origin this came over standard https.
         match http.get(&url).header("x-hop-scheme", "https").send() {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 let status = resp.status().as_u16();
                 let ctype = resp
                     .headers()
@@ -1010,10 +1021,7 @@ fn serve_http_proxy(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("application/octet-stream")
                     .to_string();
-                let mut body = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
-                if body.len() > max_resp as usize {
-                    body.truncate(max_resp as usize);
-                }
+                let body = read_response_body(&mut resp, max_resp).unwrap_or_default();
                 (status, ctype, body)
             }
             Err(_) => (
@@ -1391,6 +1399,32 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body.len(), 100, "body truncated to the max_resp cap");
         assert!(body.iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn read_response_body_never_reads_past_max_resp() {
+        // Regression for ADV-04: truncating after Response::bytes() still buffered the entire
+        // untrusted response. The bounded reader must stop pulling bytes at the negotiated cap.
+        let mut source = std::io::Cursor::new(vec![7u8; 5000]);
+        let body = read_response_body(&mut source, 100).unwrap();
+        assert_eq!(body.len(), 100);
+        assert_eq!(
+            source.position(),
+            100,
+            "the origin stream is read only to the cap"
+        );
+    }
+
+    #[test]
+    fn read_response_body_with_zero_cap_does_not_touch_the_stream() {
+        struct MustNotRead;
+        impl Read for MustNotRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a zero response allowance must not read the origin stream");
+            }
+        }
+
+        assert!(read_response_body(&mut MustNotRead, 0).unwrap().is_empty());
     }
 
     #[test]
