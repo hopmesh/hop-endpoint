@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-repository = "https://github.com/hopmesh/hop"
+repository = "https://github.com/hopmesh/monorepo"
 
 [workspace.dependencies]
 hop-core = { version = "0.0.1", package = "hop-mesh-core" }
@@ -38,7 +38,7 @@ hop-core.workspace = true
 hop-endpoint-core.workspace = true
 # services-r3-03: reuse the ONE shared, tested relay-degrade precedence (resolve_relay) so the
 # gateway and endpoint cannot drift. Default (lib-only) features — no reqwest/tungstenite pulled in.
-hop-gateway = { path = "../hop-gateway" }
+hop-gateway = { path = "../hop-gateway", version = "0.0.1" }
 # rustls feature so the endpoint can DIAL a relay over wss:// (be routable on the mesh, §30).
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

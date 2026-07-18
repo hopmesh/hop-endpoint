@@ -11,7 +11,7 @@
 # Build context is the repo root:
 #   docker build -f services/hop-endpoint/Dockerfile -t hop-example .
 
-FROM rust:1-bookworm AS build
+FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core
@@ -19,9 +19,9 @@ COPY services ./services
 COPY examples ./examples
 RUN cargo build --release -p hop-endpoint -p hop-example-origin
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates=20230311+deb12u1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/hop-endpoint /usr/local/bin/hop-endpoint
 COPY --from=build /src/target/release/hop-example-origin /usr/local/bin/hop-example-origin

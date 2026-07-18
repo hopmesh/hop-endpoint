@@ -70,14 +70,18 @@ want general, allowlisted egress instead of a single origin, that's a [gateway](
 
 ## Configure
 
-| Env / flag          | Purpose                                                          |
-| ------------------- | ---------------------------------------------------------------- |
-| `PORT`              | Cloud Run's serving port; the WebSocket bearer binds here        |
-| `HOP_DOMAIN`        | the single domain this endpoint is authorized to serve           |
-| `HOP_IDENTITY_FILE` | path to the 32-byte identity seed, for a stable published address |
-| `--origin`          | your backend base URL; the endpoint fetches only `<origin><path>` |
-| `--max-resp BYTES`  | cap on the backend response size streamed back to the mesh       |
-| `HOP_CLUSTER_SECRET`| optional: run multiple replicas that gossip handled messages     |
+| Env / flag              | Purpose                                                          |
+| ----------------------- | ---------------------------------------------------------------- |
+| `PORT`                  | Cloud Run's serving port; the WebSocket bearer binds here        |
+| `HOP_DOMAIN`            | the single domain this endpoint is authorized to serve           |
+| `HOP_IDENTITY_FILE`     | path to the 32-byte identity seed, for a stable published address |
+| `--origin`              | your backend base URL; the endpoint fetches only `<origin><path>` |
+| `--max-resp BYTES`      | cap on the backend response size streamed back to the mesh       |
+| `HOP_CLUSTER_SECRET`    | optional: run multiple replicas that gossip handled messages     |
+| `HOP_CLUSTER_REPLICA_ID`| distinct stable label required on each clustered replica         |
+
+Every clustered replica must retain its own `HOP_CLUSTER_REPLICA_ID` across restart. Sibling replicas
+share `HOP_CLUSTER_SECRET` but must not share the replica ID.
 
 ## Status
 

@@ -29,23 +29,40 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use hop_core::admission::{
+    byte_channel, ByteReceiver, ByteReservation, ByteSender, QueueAdmissionError, QueueLimits,
+};
 use hop_core::prelude::*;
 use hop_endpoint_core::Endpoint;
 
 /// This origin endpoint runs on an in-memory node, wrapped as an [`Endpoint`] so multiple replicas
 /// (same identity, no shared datastore) can cluster and reduce duplicate request processing through
 /// TTL-based membership and handled-message gossip. Clustering is off unless `HOP_CLUSTER_SECRET`
-/// is set; every replica must set the same value.
+/// is set; every replica shares that secret and sets a distinct, stable `HOP_CLUSTER_REPLICA_ID`.
 type Ep = Endpoint<hop_core::store::MemoryStore>;
 use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
+const MAX_CLUSTER_REPLICA_ID_BYTES: usize = 128;
+
+fn parse_cluster_replica_id(raw: Option<&str>) -> std::result::Result<&str, &'static str> {
+    let value = raw.ok_or("HOP_CLUSTER_REPLICA_ID is required when clustering is enabled")?;
+    if value.is_empty()
+        || value.len() > MAX_CLUSTER_REPLICA_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("HOP_CLUSTER_REPLICA_ID must be 1-128 ASCII letters, digits, '.', '_' or '-'");
+    }
+    Ok(value)
+}
 
 /// HNS reach-record TTL (DESIGN.md §30): how long a client caches this endpoint's `domain -> address`
 /// binding after fetching `/.well-known/hop`. We RE-sign well within it ([`WELL_KNOWN_RESIGN`]) so the
@@ -87,6 +104,23 @@ fn public_url_for(domain: &str) -> String {
 /// otherwise one peer could push a 64 MiB frame the single always-on instance has to buffer. A frame
 /// over this cap drops the connection, exactly as the relay's raw-TCP/WS bearer paths reject one.
 const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
+const MAX_FETCH_BODY_BYTES: u32 = 16 * 1024 * 1024;
+
+/// The driver queue retains at most 64 MiB, and one producer can retain at most one maximum-size
+/// fetched response or a small burst of mesh frames. Network readers use non-blocking admission and
+/// close on pressure; fetch workers apply bounded producer-side backpressure.
+const MAX_EVENT_QUEUE_EVENTS: usize = 256;
+const MAX_EVENT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024 + MAX_REQ_HEAD_BYTES as usize;
+const MAX_EVENT_SOURCE_EVENTS: usize = 32;
+const MAX_EVENT_SOURCE_BYTES: usize = MAX_EVENT_BYTES;
+const MAX_EVENT_BATCH: usize = 32;
+const DRIVER_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_OUTBOUND_FRAMES_PER_LINK: usize = 32;
+const FETCH_METADATA_RESERVATION_BYTES: usize = 64 * 1024;
+const FETCH_RESERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const FETCH_READ_CHUNK_BYTES: usize = 16 * 1024;
+const FRAME_RESERVATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// F-19: cap on concurrent inbound connections, so the one-thread-per-connection accept loop can't
 /// exhaust threads/memory on the single always-on instance. Generous for legitimate traffic.
@@ -154,11 +188,131 @@ fn allow_source(ip: IpAddr) -> bool {
 /// Driver events: bearer lifecycle + a completed backend fetch handed back from a worker.
 #[derive(Debug)]
 enum Ev {
-    Up(u64, Role, Sender<Vec<u8>>),
+    Up(u64, Role, SyncSender<Vec<u8>>),
     Data(u64, Vec<u8>),
     Down(u64),
     /// A finished HTTP fetch: reply (to, for_request_id, status, content_type, body).
     Fetched(PubKeyBytes, BundleId, u16, String, Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EventSource {
+    Link(u64),
+    Peer(PubKeyBytes),
+    Http(IpAddr),
+}
+
+impl Ev {
+    fn admission(&self) -> (EventSource, usize) {
+        match self {
+            Self::Up(link, _, _) | Self::Down(link) => (EventSource::Link(*link), 1),
+            Self::Data(link, bytes) => (EventSource::Link(*link), bytes.len()),
+            Self::Fetched(to, _, _, content_type, body) => (
+                EventSource::Peer(*to),
+                body.len()
+                    .saturating_add(content_type.len())
+                    .saturating_add(80),
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EventTx(ByteSender<Ev, EventSource>);
+
+impl EventTx {
+    fn send(&self, event: Ev) -> std::result::Result<(), QueueAdmissionError> {
+        let (source, bytes) = event.admission();
+        self.0.send(source, bytes, event)
+    }
+
+    #[cfg(test)]
+    fn try_send(&self, event: Ev) -> std::result::Result<(), QueueAdmissionError> {
+        let (source, bytes) = event.admission();
+        self.0.try_send(source, bytes, event)
+    }
+
+    fn try_reserve_fetched(
+        &self,
+        peer: PubKeyBytes,
+    ) -> std::result::Result<ByteReservation<Ev, EventSource>, QueueAdmissionError> {
+        self.0
+            .try_reserve(EventSource::Peer(peer), FETCH_METADATA_RESERVATION_BYTES)
+    }
+
+    fn try_reserve_http(
+        &self,
+        client: IpAddr,
+    ) -> std::result::Result<ByteReservation<Ev, EventSource>, QueueAdmissionError> {
+        self.0
+            .try_reserve(EventSource::Http(client), FETCH_METADATA_RESERVATION_BYTES)
+    }
+
+    fn send_reserved(
+        &self,
+        mut reservation: ByteReservation<Ev, EventSource>,
+        event: Ev,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        let (_, bytes) = event.admission();
+        if bytes > reservation.bytes() {
+            reservation.grow_to(bytes, FETCH_RESERVATION_TIMEOUT)?;
+        } else {
+            reservation.shrink_to(bytes);
+        }
+        reservation.send(event)
+    }
+
+    fn reserve_frame(
+        &self,
+        link: u64,
+    ) -> std::result::Result<ByteReservation<Ev, EventSource>, QueueAdmissionError> {
+        self.0.reserve_timeout(
+            EventSource::Link(link),
+            MAX_FRAME_BYTES,
+            FRAME_RESERVATION_TIMEOUT,
+        )
+    }
+
+    fn send_reserved_frame(
+        &self,
+        mut reservation: ByteReservation<Ev, EventSource>,
+        link: u64,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(QueueAdmissionError::EventTooLarge);
+        }
+        reservation.shrink_to(bytes.len());
+        reservation.try_send(Ev::Data(link, bytes))
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize) {
+        self.0.usage()
+    }
+}
+
+struct EventRx(ByteReceiver<Ev, EventSource>);
+
+impl EventRx {
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<Ev, RecvTimeoutError> {
+        self.0.recv_timeout(timeout)
+    }
+
+    fn try_recv(&self) -> std::result::Result<Ev, mpsc::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+fn event_channel() -> (EventTx, EventRx) {
+    let (tx, rx) = byte_channel(QueueLimits {
+        max_events: MAX_EVENT_QUEUE_EVENTS,
+        max_bytes: MAX_EVENT_QUEUE_BYTES,
+        max_event_bytes: MAX_EVENT_BYTES,
+        max_source_events: MAX_EVENT_SOURCE_EVENTS,
+        max_source_bytes: MAX_EVENT_SOURCE_BYTES,
+    });
+    (EventTx(tx), EventRx(rx))
 }
 
 fn now_ms() -> u64 {
@@ -173,66 +327,198 @@ fn now_ms() -> u64 {
 // endpoint imports it directly (see the `use hop_gateway::resolve_relay;` below).
 use hop_gateway::resolve_relay;
 
-/// services-r2-03: pick the per-source rate-limit key from an `X-Forwarded-For` header value.
-///
-/// XFF is `client, proxy1, proxy2, ...`, appended left-to-right as it traverses proxies. The LAST
-/// entry is the one appended by the closest trusted hop (our LB), so it is the only entry not fully
-/// client-controllable. Keying on the FIRST entry let a client rotate a spoofed leading value to
-/// dodge the per-source window; taking the LAST entry keys on the LB-appended hop instead. This is
-/// still only as trustworthy as the deployment's LB stripping/appending XFF. services-r3-02: behind
-/// a trusted LB the accept-loop `peer_addr` limiter is SKIPPED (see `accept_peer_limited`), because
-/// all LB traffic shares one peer IP and would otherwise be one global window; the count cap
-/// (`MAX_CONNS`) bounds resource use, and THIS XFF-keyed limiter is the per-client control.
-fn client_ip_from_xff(raw: &str) -> Option<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .rfind(|s| !s.is_empty())
-        .map(|s| s.to_string())
+const MAX_XFF_BYTES: usize = 512;
+const MAX_XFF_ENTRIES: usize = 8;
+const MAX_TRUSTED_PROXY_HOPS: usize = 4;
+const MAX_TRUSTED_PROXY_CIDRS: usize = 16;
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct IpCidr {
+    network: IpAddr,
+    prefix: u8,
 }
 
-/// services-r3-02: how the accept loop treats the raw TCP `peer_addr` for rate limiting.
-///
-/// Behind Cloud Run / a shared LB every client arrives from the SAME front-end IP, so the
-/// accept-loop `allow_source(peer.ip())` bucket lumps ALL users into one 100-req/10s window - a
-/// global availability cap that also sheds health probes (they share the LB IP) under load. The
-/// per-CLIENT control is the XFF-keyed limiter inside `serve_http_proxy`. When we know a trusted LB
-/// fronts us, the accept-loop peer bucket must be SKIPPED so it can't globally throttle; the count
-/// cap ([`MAX_CONNS`]) still bounds resource exhaustion, and per-client fairness is enforced on the
-/// real client IP downstream. When NOT behind a trusted proxy (direct exposure), the peer bucket
-/// stays on as the only per-source backstop.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+impl IpCidr {
+    fn parse(raw: &str) -> Option<Self> {
+        let (address, prefix) = raw.trim().split_once('/')?;
+        let address = address.parse::<IpAddr>().ok()?;
+        let prefix = prefix.parse::<u8>().ok()?;
+        let network = match address {
+            IpAddr::V4(address) if prefix <= 32 => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                let raw = u32::from(address);
+                if raw & mask != raw {
+                    return None;
+                }
+                IpAddr::V4((raw & mask).into())
+            }
+            IpAddr::V6(address) if prefix <= 128 => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                let raw = u128::from(address);
+                if raw & mask != raw {
+                    return None;
+                }
+                IpAddr::V6((raw & mask).into())
+            }
+            _ => return None,
+        };
+        Some(Self { network, prefix })
+    }
+
+    fn contains(&self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix)
+                };
+                u32::from(network) == u32::from(address) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.prefix)
+                };
+                u128::from(network) == u128::from(address) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+fn parse_proxy_cidrs(raw: Option<&str>) -> Option<Vec<IpCidr>> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.len() > MAX_XFF_BYTES {
+        return None;
+    }
+    let entries: Vec<_> = raw.split(',').map(str::trim).collect();
+    if entries.is_empty()
+        || entries.len() > MAX_TRUSTED_PROXY_CIDRS
+        || entries.iter().any(|entry| entry.is_empty())
+    {
+        return None;
+    }
+    entries.into_iter().map(IpCidr::parse).collect()
+}
+
+/// A fixed deployment topology. Forwarded headers are never trusted by default. Both the socket peer
+/// and every configured XFF suffix hop must fall inside bootstrap/deploy-provided CIDRs.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum TrustedProxy {
-    /// No trusted proxy configured: apply the accept-loop peer-IP limiter (direct exposure).
     None,
-    /// Any inbound peer is a trusted LB front-end: skip the accept-loop peer-IP limiter entirely.
-    Any,
-    /// A specific trusted LB IP: skip the peer limiter only for that peer; limit everyone else.
-    Ip(IpAddr),
+    Cidrs {
+        trusted_hops: usize,
+        peer_cidrs: Vec<IpCidr>,
+        suffix_cidrs: Vec<IpCidr>,
+    },
 }
 
-/// Resolve the trusted-proxy policy from `HOP_TRUSTED_PROXY`. `any` (or `1`/`true`/`yes`) ⇒ every
-/// peer is the LB (the Cloud Run / shared-LB deployment). A parseable IP ⇒ trust only that peer.
-/// Unset/empty/unparseable ⇒ `None` (direct exposure; keep the peer-IP limiter).
-fn resolve_trusted_proxy(env: Option<&str>) -> TrustedProxy {
-    match env.map(|s| s.trim()) {
-        Some("any") | Some("1") | Some("true") | Some("yes") => TrustedProxy::Any,
-        Some(s) if !s.is_empty() => match s.parse::<IpAddr>() {
-            Ok(ip) => TrustedProxy::Ip(ip),
-            Err(_) => TrustedProxy::None,
+fn resolve_trusted_proxy(
+    mode: Option<&str>,
+    hops: Option<&str>,
+    peer_cidrs: Option<&str>,
+    suffix_cidrs: Option<&str>,
+) -> TrustedProxy {
+    let trusted_hops = match hops.map(str::trim) {
+        None | Some("") => 1,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(value) if (1..=MAX_TRUSTED_PROXY_HOPS).contains(&value) => value,
+            _ => return TrustedProxy::None,
+        },
+    };
+    if mode.map(str::trim) != Some("google-cloud-run") {
+        return TrustedProxy::None;
+    }
+    match (
+        parse_proxy_cidrs(peer_cidrs),
+        parse_proxy_cidrs(suffix_cidrs),
+    ) {
+        (Some(peer_cidrs), Some(suffix_cidrs)) => TrustedProxy::Cidrs {
+            trusted_hops,
+            peer_cidrs,
+            suffix_cidrs,
         },
         _ => TrustedProxy::None,
     }
 }
 
-/// True ⇒ the accept loop should apply its per-`peer_addr` rate bucket to this peer. False ⇒ this
-/// peer is a trusted LB front-end, so skip the accept-loop bucket (the XFF limiter handles the real
-/// client). This is what prevents one global bucket from throttling all LB-fronted traffic.
-fn accept_peer_limited(peer_ip: IpAddr, trusted: TrustedProxy) -> bool {
+fn trusted_proxy_hops(peer_ip: IpAddr, trusted: &TrustedProxy) -> Option<usize> {
     match trusted {
-        TrustedProxy::None => true,          // direct exposure: limit every peer
-        TrustedProxy::Any => false,          // all peers are the LB: never limit at accept
-        TrustedProxy::Ip(t) => peer_ip != t, // limit everyone EXCEPT the trusted LB
+        TrustedProxy::None => None,
+        TrustedProxy::Cidrs {
+            trusted_hops,
+            peer_cidrs,
+            ..
+        } if peer_cidrs.iter().any(|cidr| cidr.contains(peer_ip)) => Some(*trusted_hops),
+        _ => None,
     }
+}
+
+fn accept_peer_limited(peer_ip: IpAddr, trusted: &TrustedProxy) -> bool {
+    trusted_proxy_hops(peer_ip, trusted).is_none()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ForwardedFor {
+    Absent,
+    Value(String),
+    Invalid,
+}
+
+fn client_ip_for_request(
+    peer_ip: IpAddr,
+    trusted: &TrustedProxy,
+    forwarded: &ForwardedFor,
+) -> std::result::Result<IpAddr, &'static str> {
+    let Some(trusted_hops) = trusted_proxy_hops(peer_ip, trusted) else {
+        return match (trusted, forwarded) {
+            (TrustedProxy::None, ForwardedFor::Absent) => Ok(peer_ip),
+            (TrustedProxy::None, _) => Err("forwarded header from untrusted peer"),
+            _ => Err("request did not arrive through the configured proxy peer"),
+        };
+    };
+    let ForwardedFor::Value(raw) = forwarded else {
+        return Err("trusted proxy request missing valid forwarded header");
+    };
+    if raw.len() > MAX_XFF_BYTES {
+        return Err("forwarded chain too long");
+    }
+    let entries: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if entries.is_empty()
+        || entries.len() > MAX_XFF_ENTRIES
+        || entries.iter().any(|entry| entry.is_empty())
+        || entries.len() <= trusted_hops
+    {
+        return Err("malformed forwarded chain");
+    }
+    let mut parsed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        parsed.push(
+            entry
+                .parse::<IpAddr>()
+                .map_err(|_| "malformed forwarded address")?,
+        );
+    }
+    let TrustedProxy::Cidrs { suffix_cidrs, .. } = trusted else {
+        return Err("forwarded header from untrusted peer");
+    };
+    if parsed[parsed.len() - trusted_hops..]
+        .iter()
+        .any(|address| !suffix_cidrs.iter().any(|cidr| cidr.contains(*address)))
+    {
+        return Err("forwarded chain has an untrusted proxy suffix");
+    }
+    Ok(parsed[parsed.len() - trusted_hops - 1])
 }
 
 /// The parsed CLI configuration. Split out of `main` so the arg-parsing decision table is a pure,
@@ -270,7 +556,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> CliConfig {
             "--origin" => origin = args.next(),
             "--domain" => domain = args.next(),
             "--identity-file" => identity_file = args.next(),
-            "--max-resp" => max_resp = args.next().and_then(|s| s.parse().ok()).unwrap_or(max_resp),
+            "--max-resp" => {
+                max_resp = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(max_resp)
+                    .min(MAX_FETCH_BODY_BYTES)
+            }
             "--relay" => {
                 relay = args.next();
                 relay_cli_set = true;
@@ -324,14 +616,20 @@ fn main() {
         println!("hop-endpoint: no relay configured; serving origin only (not mesh-routable)");
     }
 
-    // services-r3-02: when fronted by a trusted LB (Cloud Run / shared LB), skip the accept-loop
-    // per-peer rate bucket so all clients aren't lumped into one global window; per-client fairness
-    // is enforced on the real X-Forwarded-For IP downstream. Default None = direct exposure.
-    let trusted_proxy = resolve_trusted_proxy(std::env::var("HOP_TRUSTED_PROXY").ok().as_deref());
+    let trusted_proxy = resolve_trusted_proxy(
+        std::env::var("HOP_TRUSTED_PROXY").ok().as_deref(),
+        std::env::var("HOP_TRUSTED_PROXY_HOPS").ok().as_deref(),
+        std::env::var("HOP_TRUSTED_PROXY_PEER_CIDRS")
+            .ok()
+            .as_deref(),
+        std::env::var("HOP_TRUSTED_PROXY_SUFFIX_CIDRS")
+            .ok()
+            .as_deref(),
+    );
     if trusted_proxy != TrustedProxy::None {
         println!(
-            "hop-endpoint: trusted proxy = {trusted_proxy:?}; accept-loop peer rate limit skipped \
-             for the LB (per-client limit keyed on X-Forwarded-For)"
+            "hop-endpoint: trusted proxy topology = {trusted_proxy:?}; forwarded client selection \
+             uses the configured fixed suffix"
         );
     }
 
@@ -376,7 +674,7 @@ fn main() {
         .build()
         .expect("http client");
 
-    let (tx, rx) = mpsc::channel::<Ev>();
+    let (tx, rx) = event_channel();
     // A cheap clone (Arc inside) for the accept threads' plain-HTTP reverse proxy; the
     // original `http` is owned by the driver for hops:// fetches.
     let http_accept = http.clone();
@@ -398,7 +696,7 @@ fn main() {
                 // the LB's IP, so this bucket would be a global availability cap (and shed health
                 // probes); there, per-client fairness is enforced on X-Forwarded-For in the proxy.
                 if let Ok(peer) = stream.peer_addr() {
-                    if accept_peer_limited(peer.ip(), trusted_proxy) && !allow_source(peer.ip()) {
+                    if accept_peer_limited(peer.ip(), &trusted_proxy) && !allow_source(peer.ip()) {
                         drop(stream);
                         continue;
                     }
@@ -408,13 +706,18 @@ fn main() {
                     drop(stream);
                     continue;
                 }
-                let (tx, origin, http) = (tx.clone(), origin.clone(), http_accept.clone());
+                let (tx, origin, http, trusted_proxy) = (
+                    tx.clone(),
+                    origin.clone(),
+                    http_accept.clone(),
+                    trusted_proxy.clone(),
+                );
                 std::thread::spawn(move || {
                     let _guard = ConnGuard; // decrements ACTIVE_CONNS on drop (incl. panic unwind)
                                             // F-19: isolate a per-connection panic so a malformed request can't tear down
                                             // the accept loop / process (the driver still runs on the main thread).
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        serve_conn(stream, &tx, &origin, &http, max_resp)
+                        serve_conn(stream, &tx, &origin, &http, max_resp, trusted_proxy)
                     }));
                 });
             }
@@ -472,9 +775,15 @@ fn build_endpoint(
     // joins the same TTL-based membership view and gossips handled requests (DESIGN.md §40).
     if let Ok(pass) = std::env::var("HOP_CLUSTER_SECRET") {
         if !pass.is_empty() {
-            node.cluster_join_passphrase(pass.as_bytes());
+            let replica = std::env::var("HOP_CLUSTER_REPLICA_ID").ok();
+            let replica = parse_cluster_replica_id(replica.as_deref())
+                .expect("hop-endpoint: invalid cluster replica configuration");
+            assert!(
+                node.cluster_join_passphrase_for_replica(pass.as_bytes(), replica.as_bytes()),
+                "hop-endpoint: cluster member id could not be persisted"
+            );
             println!(
-                "hop-endpoint: clustering ON (HOP_CLUSTER_SECRET set); replicas coordinate duplicate work with TTL-based membership and handled gossip"
+                "hop-endpoint: clustering ON (stable replica id configured); replicas coordinate duplicate work with TTL-based membership and handled gossip"
             );
             // Optional visibility threshold (DESIGN.md §40 P3): require this many members to have
             // beaconed within the membership TTL before processing. This is not consensus or a
@@ -518,13 +827,13 @@ fn reconnect_backoff(failures: u32) -> Duration {
 /// this endpoint is reachable by its address through the mesh. Reconnects with exponential backoff
 /// (services-11) so a dead relay isn't hammered every 5s. Same read-timeout interleave as the
 /// inbound bearer, but as a TLS WebSocket client.
-fn dial_relay(url: String, ev_tx: Sender<Ev>) {
+fn dial_relay(url: String, ev_tx: EventTx) {
     use tungstenite::stream::MaybeTlsStream;
     // services-11: consecutive-failure count drives the backoff; a successful connect resets it, so a
     // real relay blip reconnects fast while a permanently-dead relay is probed at most once a minute.
     let mut failures: u32 = 0;
     loop {
-        match tungstenite::connect(&url) {
+        match tungstenite::client::connect_with_config(&url, Some(bearer_ws_config()), 3) {
             Ok((mut ws, _resp)) => {
                 failures = 0; // connected: reset the backoff
                 eprintln!("hop-endpoint: connected to relay {url}");
@@ -543,7 +852,7 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                     _ => {}
                 }
                 let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
-                let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+                let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
                 if ev_tx.send(Ev::Up(link, Role::Initiator, out_tx)).is_err() {
                     return;
                 }
@@ -577,14 +886,23 @@ fn dial_relay(url: String, ev_tx: Sender<Ev>) {
                             if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => break,
                     }
+                    let reservation = match ev_tx.reserve_frame(link) {
+                        Ok(reservation) => reservation,
+                        Err(QueueAdmissionError::TimedOut)
+                        | Err(QueueAdmissionError::QueueFull) => continue,
+                        Err(_) => break,
+                    };
                     match ws.read() {
                         Ok(Message::Binary(b)) => {
-                            if ev_tx.send(Ev::Data(link, b.to_vec())).is_err() {
+                            if ev_tx
+                                .send_reserved_frame(reservation, link, b.to_vec())
+                                .is_err()
+                            {
                                 return;
                             }
                         }
                         Ok(Message::Close(_)) => break,
-                        Ok(_) => {}
+                        Ok(_) => drop(reservation),
                         Err(tungstenite::Error::Io(e))
                             if e.kind() == std::io::ErrorKind::WouldBlock
                                 || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -626,82 +944,139 @@ fn run(
     origin: String,
     http: reqwest::blocking::Client,
     max_resp: u32,
-    tx: Sender<Ev>,
-    rx: mpsc::Receiver<Ev>,
+    tx: EventTx,
+    rx: EventRx,
 ) {
-    let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+    let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
     // Refresh the /.well-known/hop reach record before it expires (§30). Signed once in `main` before
     // the accept loop starts; re-signed here every WELL_KNOWN_RESIGN so a long-lived process never
     // serves an expired record.
     let public_url = public_url_for(&domain);
     let mut last_wk = Instant::now();
+    let mut next_tick = Instant::now() + DRIVER_TICK_INTERVAL;
     loop {
-        // services-r3-04: the accept threads wrap serve_conn in catch_unwind so one malformed request
-        // can't tear down the process, but the driver's own parse/handle ran unguarded on this thread.
-        // A core panic while parsing a malformed/hostile bundle (BearerEvent::Data) would then kill
-        // the whole endpoint. Mirror the accept path: run every node.* call that touches attacker-
-        // controlled bytes under catch_unwind, so a core panic becomes a logged skip, not process
-        // death. node is `&mut`, so AssertUnwindSafe (same as serve_conn's wrapper); on a caught
-        // panic the node keeps running and the next event is processed.
-        match rx.recv_timeout(Duration::from_millis(1000)) {
-            Ok(Ev::Up(link, role, out)) => {
-                writers.insert(link, out);
-                guard_core("bearer-connected", || {
-                    node.handle(BearerEvent::Connected(link, role))
-                });
-            }
-            Ok(Ev::Data(link, bytes)) => {
-                // The malformed-bundle path: bytes are attacker-controlled, so guard the parse/handle.
-                guard_core("bearer-data", || {
-                    node.handle(BearerEvent::Data(link, bytes))
-                });
-            }
-            Ok(Ev::Down(link)) => {
-                writers.remove(&link);
-                guard_core("bearer-disconnected", || {
-                    node.handle(BearerEvent::Disconnected(link))
-                });
-            }
-            Ok(Ev::Fetched(to, for_id, status, content_type, body)) => {
-                // Carry the origin's content-type back so a hops:// client (e.g. a WebView)
-                // renders each resource correctly (HTML/CSS/JS/image).
-                guard_core("http-response", || {
-                    let _ = node.send_http_response(
-                        to,
-                        for_id,
-                        status,
-                        vec![("content-type".to_string(), content_type)],
-                        body,
-                    );
-                });
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                guard_core("tick", || node.tick(now_ms()));
-                // Re-sign the well-known reach record so its expiry always stays in the future.
-                if last_wk.elapsed() >= WELL_KNOWN_RESIGN {
-                    if let Ok(mut wk) = well_known_body().lock() {
-                        *wk = sign_well_known(&node, &public_url);
-                    }
-                    last_wk = Instant::now();
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+        if !process_driver_events(
+            &mut node,
+            &mut writers,
+            &rx,
+            &mut next_tick,
+            &mut last_wk,
+            &public_url,
+        ) {
+            break;
         }
 
         // Translate any inbound hops requests against our OWN origin (path only). take_http_requests
         // parses attacker-controlled bundle contents, so guard it too; on a panic, skip this cycle.
         let requests =
             guard_core("take-http-requests", || node.take_http_requests()).unwrap_or_default();
-        handle_http_requests(requests, &domain, &origin, &http, max_resp, &tx);
+        for response in handle_http_requests(requests, &domain, &origin, &http, max_resp, &tx) {
+            apply_driver_event(&mut node, &mut writers, response);
+        }
 
         let outgoing = guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default();
+        let mut blocked = Vec::new();
         for (link, bytes) in outgoing {
             if let Some(out) = writers.get(&link) {
-                if out.send(bytes).is_err() {
-                    writers.remove(&link);
+                if matches!(
+                    out.try_send(bytes),
+                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_))
+                ) {
+                    blocked.push(link);
                 }
             }
         }
+        for link in blocked {
+            writers.remove(&link);
+            guard_core("bearer-disconnected", || {
+                node.handle(BearerEvent::Disconnected(link))
+            });
+        }
+    }
+}
+
+fn process_driver_events(
+    node: &mut Ep,
+    writers: &mut HashMap<u64, SyncSender<Vec<u8>>>,
+    rx: &EventRx,
+    next_tick: &mut Instant,
+    last_wk: &mut Instant,
+    public_url: &str,
+) -> bool {
+    tick_if_due(node, next_tick, last_wk, public_url);
+    let wait = next_tick.saturating_duration_since(Instant::now());
+    let first = match rx.recv_timeout(wait) {
+        Ok(event) => Some(event),
+        Err(RecvTimeoutError::Timeout) => {
+            tick_if_due(node, next_tick, last_wk, public_url);
+            None
+        }
+        Err(RecvTimeoutError::Disconnected) => return false,
+    };
+    if let Some(first) = first {
+        apply_driver_event(node, writers, first);
+        for _ in 1..MAX_EVENT_BATCH {
+            if Instant::now() >= *next_tick {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(event) => apply_driver_event(node, writers, event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+    tick_if_due(node, next_tick, last_wk, public_url);
+    true
+}
+
+fn apply_driver_event(node: &mut Ep, writers: &mut HashMap<u64, SyncSender<Vec<u8>>>, event: Ev) {
+    match event {
+        Ev::Up(link, role, out) => {
+            writers.insert(link, out);
+            guard_core("bearer-connected", || {
+                node.handle(BearerEvent::Connected(link, role))
+            });
+        }
+        Ev::Data(link, bytes) => {
+            guard_core("bearer-data", || {
+                node.handle(BearerEvent::Data(link, bytes))
+            });
+        }
+        Ev::Down(link) => {
+            writers.remove(&link);
+            guard_core("bearer-disconnected", || {
+                node.handle(BearerEvent::Disconnected(link))
+            });
+        }
+        Ev::Fetched(to, for_id, status, content_type, body) => {
+            guard_core("http-response", || {
+                let _ = node.send_http_response(
+                    to,
+                    for_id,
+                    status,
+                    vec![("content-type".to_string(), content_type)],
+                    body,
+                );
+            });
+        }
+    }
+}
+
+fn tick_if_due(node: &mut Ep, next_tick: &mut Instant, last_wk: &mut Instant, public_url: &str) {
+    let monotonic_now = Instant::now();
+    if monotonic_now < *next_tick {
+        return;
+    }
+    guard_core("tick", || node.tick(now_ms()));
+    while *next_tick <= monotonic_now {
+        *next_tick += DRIVER_TICK_INTERVAL;
+    }
+    if last_wk.elapsed() >= WELL_KNOWN_RESIGN {
+        if let Ok(mut wk) = well_known_body().lock() {
+            *wk = sign_well_known(node, public_url);
+        }
+        *last_wk = monotonic_now;
     }
 }
 
@@ -709,16 +1084,17 @@ fn run(
 /// protocol-level domain binding (reject a non-matching `host` with 403 before any backend touch),
 /// shed over the in-flight fetch cap with 503, and otherwise spawn a bounded worker to fetch the
 /// origin and reply. Split out of `run` so the security-critical routing decisions (domain binding,
-/// the busy cap) are unit-testable without wiring up the whole driver loop. Replies are sent as
-/// [`Ev::Fetched`] on `tx`, exactly as the inline loop did (behavior-preserving).
+/// the busy cap) are unit-testable without wiring up the whole driver loop. Immediate replies are
+/// returned to the driver; worker replies use the bounded event channel with backpressure.
 fn handle_http_requests(
     requests: Vec<hop_core::node::HttpReqItem>,
     domain: &str,
     origin: &str,
     http: &reqwest::blocking::Client,
     max_resp: u32,
-    tx: &Sender<Ev>,
-) {
+    tx: &EventTx,
+) -> Vec<Ev> {
+    let mut immediate = Vec::new();
     for r in requests {
         // Protocol-level domain binding: refuse anything not addressed to our domain
         // BEFORE spawning a fetch. The signed `host` must equal our single --domain.
@@ -730,7 +1106,7 @@ fn handle_http_requests(
             );
             let body = format!("hop-endpoint: this endpoint only serves {domain}").into_bytes();
             let ct = "text/plain; charset=utf-8".to_string();
-            let _ = tx.send(Ev::Fetched(r.from, r.id, 403, ct, body));
+            immediate.push(Ev::Fetched(r.from, r.id, 403, ct, body));
             continue;
         }
         // services-10: bound concurrent fetch workers. Mesh requests bypass the TCP IP limiter,
@@ -740,16 +1116,26 @@ fn handle_http_requests(
             INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
             let ct = "text/plain; charset=utf-8".to_string();
             let body = b"hop-endpoint: busy, try again".to_vec();
-            let _ = tx.send(Ev::Fetched(r.from, r.id, 503, ct, body));
+            immediate.push(Ev::Fetched(r.from, r.id, 503, ct, body));
             continue;
         }
+        let reservation = match tx.try_reserve_fetched(r.from) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                INFLIGHT_FETCHES.fetch_sub(1, Ordering::SeqCst);
+                let ct = "text/plain; charset=utf-8".to_string();
+                let body = b"hop-endpoint: response budget saturated".to_vec();
+                immediate.push(Ev::Fetched(r.from, r.id, 503, ct, body));
+                continue;
+            }
+        };
         let (origin, http, tx) = (origin.to_string(), http.clone(), tx.clone());
         std::thread::spawn(move || {
             let _guard = FetchGuard; // decrements INFLIGHT_FETCHES on drop (incl. panic unwind)
-            let (status, ctype, body) = fetch(&http, &origin, &r, max_resp);
-            let _ = tx.send(Ev::Fetched(r.from, r.id, status, ctype, body));
+            fetch_reserved(&http, &origin, &r, max_resp, &tx, reservation);
         });
     }
+    immediate
 }
 
 /// services-r3-04: run a node call that touches attacker-controlled bytes under catch_unwind, so a
@@ -778,6 +1164,7 @@ fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
 
 /// Execute one request against our origin. The request's `url` is treated as a **path** and
 /// appended to the fixed origin - the endpoint never fetches any other host. v1 is GET-only.
+#[cfg(test)]
 fn fetch(
     http: &reqwest::blocking::Client,
     origin: &str,
@@ -807,10 +1194,137 @@ fn fetch(
     }
 }
 
+fn fetch_reserved(
+    http: &reqwest::blocking::Client,
+    origin: &str,
+    r: &hop_core::node::HttpReqItem,
+    max_resp: u32,
+    tx: &EventTx,
+    mut reservation: ByteReservation<Ev, EventSource>,
+) {
+    let plain = "text/plain; charset=utf-8".to_string();
+    if !r.method.eq_ignore_ascii_case("GET") {
+        let event = Ev::Fetched(
+            r.from,
+            r.id,
+            405,
+            plain,
+            b"hop-endpoint: only GET in v1".to_vec(),
+        );
+        let _ = tx.send_reserved(reservation, event);
+        return;
+    }
+    let url = format!("{origin}{}", path_of(&r.url));
+    let mut response = match http.get(&url).header("x-hop-scheme", "hops").send() {
+        Ok(response) => response,
+        Err(_) => {
+            let event = Ev::Fetched(
+                r.from,
+                r.id,
+                502,
+                plain,
+                b"hop-endpoint: backend unreachable".to_vec(),
+            );
+            let _ = tx.send_reserved(reservation, event);
+            return;
+        }
+    };
+    let status = response.status().as_u16();
+    let content_type = bounded_content_type(&response);
+    let metadata = content_type
+        .len()
+        .saturating_add(80)
+        .max(FETCH_METADATA_RESERVATION_BYTES.min(MAX_EVENT_BYTES));
+    let initial = response_reservation_bytes(response.content_length(), max_resp, metadata);
+    if reservation
+        .grow_to(initial, FETCH_RESERVATION_TIMEOUT)
+        .is_err()
+    {
+        let event = Ev::Fetched(
+            r.from,
+            r.id,
+            503,
+            plain,
+            b"hop-endpoint: response budget saturated".to_vec(),
+        );
+        let _ = tx.send_reserved(reservation, event);
+        return;
+    }
+    let body =
+        match read_response_body_reserved(&mut response, max_resp, metadata, &mut reservation) {
+            Ok(body) => body,
+            Err(_) => {
+                let event = Ev::Fetched(
+                    r.from,
+                    r.id,
+                    502,
+                    plain,
+                    b"hop-endpoint: backend response failed".to_vec(),
+                );
+                let _ = tx.send_reserved(reservation, event);
+                return;
+            }
+        };
+    let _ = tx.send_reserved(
+        reservation,
+        Ev::Fetched(r.from, r.id, status, content_type, body),
+    );
+}
+
+fn bounded_content_type(response: &reqwest::blocking::Response) -> String {
+    let raw = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    raw.chars()
+        .take(FETCH_METADATA_RESERVATION_BYTES.saturating_sub(80))
+        .collect()
+}
+
+fn response_reservation_bytes(
+    content_length: Option<u64>,
+    max_resp: u32,
+    metadata: usize,
+) -> usize {
+    let body_cap = max_resp as usize;
+    let body = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .map(|length| length.min(body_cap))
+        .unwrap_or(body_cap);
+    metadata.saturating_add(body).min(MAX_EVENT_BYTES)
+}
+
+fn read_response_body_reserved(
+    reader: &mut impl Read,
+    max_resp: u32,
+    metadata: usize,
+    reservation: &mut ByteReservation<Ev, EventSource>,
+) -> std::result::Result<Vec<u8>, QueueAdmissionError> {
+    let cap = max_resp as usize;
+    let mut body = Vec::new();
+    let mut chunk = [0u8; FETCH_READ_CHUNK_BYTES];
+    while body.len() < cap {
+        let allowance = (cap - body.len()).min(chunk.len());
+        let read = reader
+            .read(&mut chunk[..allowance])
+            .map_err(|_| QueueAdmissionError::Disconnected)?;
+        if read == 0 {
+            break;
+        }
+        let next = metadata.saturating_add(body.len()).saturating_add(read);
+        reservation.grow_to(next, FETCH_RESERVATION_TIMEOUT)?;
+        body.reserve_exact(read);
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Ok(body)
+}
+
 /// Read at most the protocol-negotiated response allowance from an origin stream.
 ///
 /// `Read::take` is important here: truncating after `Response::bytes()` would first buffer an
 /// untrusted response in full, allowing a large or endless backend body to exhaust endpoint memory.
+#[cfg(test)]
 fn read_response_body(reader: &mut impl Read, max_resp: u32) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     reader.take(u64::from(max_resp)).read_to_end(&mut body)?;
@@ -842,7 +1356,7 @@ fn path_of(url: &str) -> String {
 struct RequestHead {
     method: String,
     raw_path: String,
-    xff: Option<String>,
+    xff: ForwardedFor,
 }
 
 /// services-r3-03: read the request line + headers from a reader that is ALREADY byte-capped (the
@@ -865,7 +1379,7 @@ fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
     let raw_path = parts.next().unwrap_or("/").to_string();
     // Drain the rest of the headers so the client's send completes cleanly, capturing the real
     // client IP from `X-Forwarded-For`. The `.take()` cap bounds the total bytes read here.
-    let mut xff: Option<String> = None;
+    let mut xff = ForwardedFor::Absent;
     let mut line = String::new();
     loop {
         line.clear();
@@ -886,7 +1400,14 @@ fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
                     .filter(|(k, _)| k.trim().eq_ignore_ascii_case("x-forwarded-for"))
                     .map(|(_, v)| v)
                 {
-                    xff = client_ip_from_xff(v);
+                    xff = match xff {
+                        ForwardedFor::Absent
+                            if !v.trim().is_empty() && v.trim().len() <= MAX_XFF_BYTES =>
+                        {
+                            ForwardedFor::Value(v.trim().to_string())
+                        }
+                        _ => ForwardedFor::Invalid,
+                    };
                 }
             }
             Err(_) => break,
@@ -905,9 +1426,11 @@ fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
 /// there's no open-proxy surface. v1 is GET/HEAD.
 fn serve_http_proxy(
     mut stream: TcpStream,
+    event_tx: &EventTx,
     origin: &str,
     http: &reqwest::blocking::Client,
     max_resp: u32,
+    trusted_proxy: TrustedProxy,
 ) {
     // Read the request line + headers (up to the blank line); we only need method + path.
     // services-r3-03: cap the total request-line + header bytes so a hostile client can't grow the
@@ -937,6 +1460,25 @@ fn serve_http_proxy(
         raw_path,
         xff,
     } = head;
+    let peer_ip = match stream.peer_addr() {
+        Ok(peer) => peer.ip(),
+        Err(_) => return,
+    };
+    let client_ip = match client_ip_for_request(peer_ip, &trusted_proxy, &xff) {
+        Ok(ip) => ip,
+        Err(reason) => {
+            let body = format!("hop-endpoint: invalid forwarding topology: {reason}");
+            let header = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            return;
+        }
+    };
 
     // services-08: a cheap liveness endpoint that never touches the origin, so the LB / uptime
     // checks can confirm the driver process is up (the sibling of relayd's F-17 /healthz).
@@ -982,15 +1524,35 @@ fn serve_http_proxy(
         return;
     }
 
-    // services-06: behind Cloud Run / the shared LB the TCP peer is Google's front-end, not the
-    // end user, so the accept-loop peer_addr limiter buckets everyone together. Re-key the limit on
-    // the real client IP from X-Forwarded-For when present; shed a client over its window budget.
-    if let Some(ip_str) = &xff {
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-            if !allow_source(ip) {
-                let body = b"hop-endpoint: rate limited";
+    if trusted_proxy_hops(peer_ip, &trusted_proxy).is_some() && !allow_source(client_ip) {
+        let body = b"hop-endpoint: rate limited";
+        let header = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+        return;
+    }
+
+    let head_only = method.eq_ignore_ascii_case("HEAD");
+    let mut response_reservation = None;
+    let mut advertised_length = None;
+    let (status, ctype, body) = if !method.eq_ignore_ascii_case("GET") && !head_only {
+        (
+            405u16,
+            "text/plain; charset=utf-8".to_string(),
+            b"hop-endpoint: only GET/HEAD over plain HTTP".to_vec(),
+        )
+    } else {
+        let mut reservation = match event_tx.try_reserve_http(client_ip) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                let body = b"hop-endpoint: response budget saturated";
                 let header = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\n\
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
@@ -999,29 +1561,51 @@ fn serve_http_proxy(
                 let _ = stream.flush();
                 return;
             }
-        }
-    }
-
-    let head_only = method.eq_ignore_ascii_case("HEAD");
-    let (status, ctype, body) = if !method.eq_ignore_ascii_case("GET") && !head_only {
-        (
-            405u16,
-            "text/plain; charset=utf-8".to_string(),
-            b"hop-endpoint: only GET/HEAD over plain HTTP".to_vec(),
-        )
-    } else {
+        };
         let url = format!("{origin}{path_only}");
         // The LB terminated TLS for us; tell the origin this came over standard https.
         match http.get(&url).header("x-hop-scheme", "https").send() {
             Ok(mut resp) => {
                 let status = resp.status().as_u16();
-                let ctype = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                let body = read_response_body(&mut resp, max_resp).unwrap_or_default();
+                if head_only {
+                    advertised_length = resp
+                        .content_length()
+                        .and_then(|length| usize::try_from(length).ok())
+                        .map(|length| length.min(max_resp as usize));
+                }
+                let ctype = bounded_content_type(&resp);
+                let metadata = ctype
+                    .len()
+                    .saturating_add(80)
+                    .max(FETCH_METADATA_RESERVATION_BYTES.min(MAX_EVENT_BYTES));
+                let initial = if head_only {
+                    metadata
+                } else {
+                    response_reservation_bytes(resp.content_length(), max_resp, metadata)
+                };
+                if reservation
+                    .grow_to(initial, FETCH_RESERVATION_TIMEOUT)
+                    .is_err()
+                {
+                    let body = b"hop-endpoint: response budget saturated";
+                    let header = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                    return;
+                }
+                let body = if head_only {
+                    Vec::new()
+                } else {
+                    read_response_body_reserved(&mut resp, max_resp, metadata, &mut reservation)
+                        .unwrap_or_default()
+                };
+                reservation.shrink_to(metadata.saturating_add(body.len()));
+                response_reservation = Some(reservation);
                 (status, ctype, body)
             }
             Err(_) => (
@@ -1033,16 +1617,18 @@ fn serve_http_proxy(
     };
 
     let reason = if status == 200 { "OK" } else { "" };
+    let content_length = advertised_length.unwrap_or(body.len());
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n",
-        body.len()
+        content_length
     );
     let _ = stream.write_all(header.as_bytes());
     if !head_only {
         let _ = stream.write_all(&body);
     }
     let _ = stream.flush();
+    drop(response_reservation);
 }
 
 /// What a peeked connection is: a WebSocket upgrade (a hops:// bearer link), a plain HTTP request
@@ -1136,10 +1722,11 @@ fn bearer_ws_config() -> tungstenite::protocol::WebSocketConfig {
 /// the bytes intact for whichever handler takes over (the relay's WS bearer does the same).
 fn serve_conn(
     stream: TcpStream,
-    ev_tx: &Sender<Ev>,
+    ev_tx: &EventTx,
     origin: &str,
     http: &reqwest::blocking::Client,
     max_resp: u32,
+    trusted_proxy: TrustedProxy,
 ) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -1151,7 +1738,7 @@ fn serve_conn(
     // classified correctly. The bytes stay in the socket buffer for whichever handler takes over.
     match peek_kind(&stream) {
         PeekKind::HttpProxy => {
-            serve_http_proxy(stream, origin, http, max_resp);
+            serve_http_proxy(stream, ev_tx, origin, http, max_resp, trusted_proxy);
             return;
         }
         PeekKind::WsUpgrade => {}  // fall through to the WS handshake below
@@ -1170,7 +1757,7 @@ fn serve_conn(
         .set_read_timeout(Some(Duration::from_millis(100)));
 
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
     if ev_tx.send(Ev::Up(link, Role::Responder, out_tx)).is_err() {
         return;
     }
@@ -1189,14 +1776,22 @@ fn serve_conn(
         if ws.flush().is_err() {
             break;
         }
+        let reservation = match ev_tx.reserve_frame(link) {
+            Ok(reservation) => reservation,
+            Err(QueueAdmissionError::TimedOut) | Err(QueueAdmissionError::QueueFull) => continue,
+            Err(_) => break,
+        };
         match ws.read() {
             Ok(Message::Binary(b)) => {
-                if ev_tx.send(Ev::Data(link, b.to_vec())).is_err() {
+                if ev_tx
+                    .send_reserved_frame(reservation, link, b.to_vec())
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {}
+            Ok(_) => drop(reservation),
             Err(tungstenite::Error::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -1263,6 +1858,19 @@ fn write_secret_600(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_PROXY_SUFFIX_CIDRS: &str = "192.0.2.8/32,2001:db8::8/128";
+
+    fn trusted_policy(hops: usize, peer_cidrs: &str) -> TrustedProxy {
+        let policy = resolve_trusted_proxy(
+            Some("google-cloud-run"),
+            Some(&hops.to_string()),
+            Some(peer_cidrs),
+            Some(TEST_PROXY_SUFFIX_CIDRS),
+        );
+        assert_ne!(policy, TrustedProxy::None);
+        policy
+    }
 
     /// A throwaway one-shot HTTP/1.1 origin: it serves `n` sequential requests, each with a fixed
     /// status/content-type/body, and records the request line + `x-hop-scheme` header it saw so a
@@ -1428,6 +2036,71 @@ mod tests {
     }
 
     #[test]
+    fn absent_and_lying_content_length_are_reserved_before_each_body_growth() {
+        let metadata = FETCH_METADATA_RESERVATION_BYTES;
+        let cap = 128 * 1024u32;
+        assert_eq!(
+            response_reservation_bytes(None, cap, metadata),
+            metadata + cap as usize,
+            "absent or chunked length reserves the configured maximum"
+        );
+        assert_eq!(
+            response_reservation_bytes(Some(u64::MAX), cap, metadata),
+            metadata + cap as usize,
+            "a claimed length is capped at the configured maximum"
+        );
+        let (tx, rx) = event_channel();
+        let mut reservation = tx.try_reserve_fetched([3u8; 32]).unwrap();
+        let claimed = response_reservation_bytes(Some(1), cap, metadata);
+        reservation
+            .grow_to(claimed, FETCH_RESERVATION_TIMEOUT)
+            .unwrap();
+        let mut lying_body = std::io::Cursor::new(vec![9u8; cap as usize]);
+        let body =
+            read_response_body_reserved(&mut lying_body, cap, metadata, &mut reservation).unwrap();
+        assert_eq!(body.len(), cap as usize);
+        assert_eq!(reservation.bytes(), metadata + cap as usize);
+        assert!(tx.usage().1 <= MAX_EVENT_QUEUE_BYTES);
+        drop(reservation);
+        assert_eq!(tx.usage(), (0, 0));
+        drop(rx);
+    }
+
+    #[test]
+    fn one_hundred_twenty_eight_fetch_producers_share_one_fixed_byte_ceiling_and_recover() {
+        let (tx, rx) = event_channel();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(129));
+        let mut workers = Vec::new();
+        for index in 0..128u8 {
+            let tx = tx.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                tx.0.try_reserve(EventSource::Peer([index; 32]), MAX_EVENT_BYTES)
+                    .ok()
+            }));
+        }
+        barrier.wait();
+        let reservations: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            reservations.len(),
+            MAX_EVENT_QUEUE_BYTES / MAX_EVENT_BYTES,
+            "only producers whose complete maximum response fits are admitted"
+        );
+        assert!(tx.usage().1 <= MAX_EVENT_QUEUE_BYTES);
+        drop(reservations);
+        assert_eq!(tx.usage(), (0, 0));
+        assert!(tx
+            .0
+            .try_reserve(EventSource::Peer([255u8; 32]), MAX_EVENT_BYTES)
+            .is_ok());
+        drop(rx);
+    }
+
+    #[test]
     fn fetch_returns_502_when_the_backend_is_unreachable() {
         // A refused/dead origin must surface as 502 (backend unreachable), not a panic or a hang.
         let http = test_client();
@@ -1441,13 +2114,24 @@ mod tests {
     /// return the full raw HTTP response the handler wrote back. `origin` is the backend it proxies
     /// to (use a `stub_origin`, or a dead port for the 502 path).
     fn drive_proxy(request: &[u8], origin: &str, max_resp: u32) -> String {
+        drive_proxy_with_policy(request, origin, max_resp, TrustedProxy::None)
+    }
+
+    fn drive_proxy_with_policy(
+        request: &[u8],
+        origin: &str,
+        max_resp: u32,
+        trusted_proxy: TrustedProxy,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let origin = origin.to_string();
         let http = test_client();
+        let (event_tx, event_rx) = event_channel();
         let server = std::thread::spawn(move || {
+            let _event_rx = event_rx;
             let (sock, _) = listener.accept().unwrap();
-            serve_http_proxy(sock, &origin, &http, max_resp);
+            serve_http_proxy(sock, &event_tx, &origin, &http, max_resp, trusted_proxy);
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(request).unwrap();
@@ -1606,13 +2290,45 @@ mod tests {
             assert!(allow_source(ip));
         }
         // This IP is now over budget. A proxied request presenting it in XFF is rate-limited.
-        let req = b"GET /r HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.42\r\n\r\n";
-        let resp = drive_proxy(req, "http://127.0.0.1:1", 1024);
+        let req =
+            b"GET /r HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.42, 192.0.2.8\r\n\r\n";
+        let resp = drive_proxy_with_policy(
+            req,
+            "http://127.0.0.1:1",
+            1024,
+            trusted_policy(1, "127.0.0.1/32"),
+        );
         assert!(
             resp.starts_with("HTTP/1.1 429"),
             "an over-budget XFF client is rate-limited before the origin: {resp}"
         );
         assert!(resp.contains("rate limited"));
+    }
+
+    #[test]
+    fn two_clients_behind_one_lb_have_isolated_buckets() {
+        let peer: IpAddr = "10.9.0.1".parse().unwrap();
+        let policy = trusted_policy(1, "10.9.0.1/32");
+        let first = client_ip_for_request(
+            peer,
+            &policy,
+            &ForwardedFor::Value("198.51.100.77, 192.0.2.8".into()),
+        )
+        .unwrap();
+        let second = client_ip_for_request(
+            peer,
+            &policy,
+            &ForwardedFor::Value("198.51.100.78, 192.0.2.8".into()),
+        )
+        .unwrap();
+        for _ in 0..MAX_REQ_PER_WINDOW {
+            assert!(allow_source(first));
+        }
+        assert!(!allow_source(first));
+        assert!(
+            allow_source(second),
+            "the second client has an independent bucket"
+        );
     }
 
     #[test]
@@ -1680,27 +2396,67 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_from_xff_takes_the_trusted_last_hop() {
-        // services-r2-03: key the per-source limit on the LAST XFF entry (the LB-appended hop), not
-        // the FIRST (client-controllable) one, so a client can't rotate a spoofed leading value to
-        // dodge its window.
+    fn forwarded_client_is_immediately_before_the_trusted_suffix() {
+        let peer: IpAddr = "10.0.0.8".parse().unwrap();
+        let policy = trusted_policy(1, "10.0.0.8/32,fd00::8/128");
         assert_eq!(
-            client_ip_from_xff("1.1.1.1, 2.2.2.2, 3.3.3.3").as_deref(),
-            Some("3.3.3.3"),
-            "last (LB-appended) hop, not the first client-supplied one"
+            client_ip_for_request(
+                peer,
+                &policy,
+                &ForwardedFor::Value("192.0.2.9, 198.51.100.7, 192.0.2.8".into()),
+            ),
+            Ok("198.51.100.7".parse().unwrap()),
+            "ignore the user-supplied left prefix and the trusted LB suffix"
         );
         assert_eq!(
-            client_ip_from_xff("9.9.9.9").as_deref(),
-            Some("9.9.9.9"),
-            "single entry is that entry"
+            client_ip_for_request(
+                "fd00::8".parse().unwrap(),
+                &policy,
+                &ForwardedFor::Value("2001:db8::44, 2001:db8::8".into()),
+            ),
+            Ok("2001:db8::44".parse().unwrap()),
+            "IPv6 clients use the same fixed suffix rule"
         );
-        // Whitespace + trailing-comma noise is trimmed; empties are ignored.
-        assert_eq!(
-            client_ip_from_xff("  1.1.1.1 ,  4.4.4.4 , ").as_deref(),
-            Some("4.4.4.4")
+    }
+
+    #[test]
+    fn forwarded_chains_fail_closed_when_untrusted_or_malformed() {
+        let direct: IpAddr = "203.0.113.10".parse().unwrap();
+        assert!(client_ip_for_request(
+            direct,
+            &TrustedProxy::None,
+            &ForwardedFor::Value("198.51.100.1, 192.0.2.8".into())
+        )
+        .is_err());
+        let peer: IpAddr = "10.1.2.3".parse().unwrap();
+        let policy = trusted_policy(1, "10.1.2.3/32");
+        for forwarded in [
+            ForwardedFor::Absent,
+            ForwardedFor::Invalid,
+            ForwardedFor::Value(String::new()),
+            ForwardedFor::Value("198.51.100.1,".into()),
+            ForwardedFor::Value("not-an-ip, 192.0.2.8".into()),
+            ForwardedFor::Value("192.0.2.8".into()),
+            ForwardedFor::Value("198.51.100.1, 10.2.3.4".into()),
+            ForwardedFor::Value("1.1.1.1,".repeat(MAX_XFF_ENTRIES + 1)),
+            ForwardedFor::Value("1".repeat(MAX_XFF_BYTES + 1)),
+        ] {
+            assert!(client_ip_for_request(peer, &policy, &forwarded).is_err());
+        }
+        assert!(
+            client_ip_for_request(
+                "10.1.2.4".parse().unwrap(),
+                &policy,
+                &ForwardedFor::Value("198.51.100.1, 192.0.2.8".into()),
+            )
+            .is_err(),
+            "an arbitrary private socket peer cannot spoof a valid LB suffix"
         );
-        assert_eq!(client_ip_from_xff("").as_deref(), None);
-        assert_eq!(client_ip_from_xff(" , ").as_deref(), None);
+        assert!(
+            client_ip_for_request("10.1.2.4".parse().unwrap(), &policy, &ForwardedFor::Absent,)
+                .is_err(),
+            "an internal direct caller without the configured proxy suffix fails closed"
+        );
     }
 
     #[test]
@@ -1719,23 +2475,61 @@ mod tests {
 
     #[test]
     fn resolve_trusted_proxy_maps_env_to_policy() {
-        // services-r3-02: `any`/truthy => trust every peer (Cloud Run / shared LB); a bare IP =>
-        // trust only that peer; unset/empty/garbage => None (direct exposure, keep the limiter).
-        assert_eq!(resolve_trusted_proxy(Some("any")), TrustedProxy::Any);
-        assert_eq!(resolve_trusted_proxy(Some("1")), TrustedProxy::Any);
-        assert_eq!(resolve_trusted_proxy(Some("true")), TrustedProxy::Any);
-        assert_eq!(resolve_trusted_proxy(Some(" yes ")), TrustedProxy::Any);
         assert_eq!(
-            resolve_trusted_proxy(Some("10.0.0.1")),
-            TrustedProxy::Ip("10.0.0.1".parse().unwrap())
+            resolve_trusted_proxy(
+                Some("google-cloud-run"),
+                None,
+                Some("169.254.8.129/32"),
+                Some(TEST_PROXY_SUFFIX_CIDRS),
+            ),
+            trusted_policy(1, "169.254.8.129/32")
         );
-        assert_eq!(resolve_trusted_proxy(None), TrustedProxy::None);
-        assert_eq!(resolve_trusted_proxy(Some("")), TrustedProxy::None);
         assert_eq!(
-            resolve_trusted_proxy(Some("not-an-ip")),
-            TrustedProxy::None,
-            "unparseable => direct exposure (fail closed to the safe limiter)"
+            resolve_trusted_proxy(
+                Some("google-cloud-run"),
+                Some("2"),
+                Some("169.254.8.129/32"),
+                Some(TEST_PROXY_SUFFIX_CIDRS),
+            ),
+            trusted_policy(2, "169.254.8.129/32")
         );
+        for mode in [None, Some(""), Some("any"), Some("true"), Some("not-an-ip")] {
+            assert_eq!(
+                resolve_trusted_proxy(
+                    mode,
+                    None,
+                    Some("169.254.8.129/32"),
+                    Some(TEST_PROXY_SUFFIX_CIDRS),
+                ),
+                TrustedProxy::None
+            );
+        }
+        assert_eq!(
+            resolve_trusted_proxy(
+                Some("google-cloud-run"),
+                Some("0"),
+                Some("169.254.8.129/32"),
+                Some(TEST_PROXY_SUFFIX_CIDRS),
+            ),
+            TrustedProxy::None
+        );
+        for (peers, suffixes) in [
+            (None, Some(TEST_PROXY_SUFFIX_CIDRS)),
+            (Some("169.254.8.129/32"), None),
+            (Some("10.0.0.1/8"), Some(TEST_PROXY_SUFFIX_CIDRS)),
+            (Some("169.254.8.129/32"), Some("35.191.1.1/16")),
+        ] {
+            assert_eq!(
+                resolve_trusted_proxy(Some("google-cloud-run"), None, peers, suffixes),
+                TrustedProxy::None
+            );
+        }
+        assert!(IpCidr::parse("35.191.0.0/16")
+            .unwrap()
+            .contains("35.191.255.254".parse().unwrap()));
+        assert!(IpCidr::parse("2600:2d00:1:1::/64")
+            .unwrap()
+            .contains("2600:2d00:1:1::beef".parse().unwrap()));
     }
 
     #[test]
@@ -1745,31 +2539,29 @@ mod tests {
         // would shed real traffic (and health probes) - a global availability cap. With the LB
         // trusted, the accept loop never applies the peer limiter, so an unbounded number of LB-
         // fronted requests pass the accept gate (per-client fairness is enforced on XFF downstream).
-        let lb_ip: IpAddr = "35.191.0.5".parse().unwrap(); // stand-in for the shared LB front-end
-
-        // Trust ANY peer (Cloud Run): the accept-loop bucket is never applied to the LB IP, so far
-        // MORE than MAX_REQ_PER_WINDOW connections from that one peer IP are admitted at the gate.
+        let lb_ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let cloud_run = trusted_policy(1, "10.0.0.5/32");
         for _ in 0..(MAX_REQ_PER_WINDOW * 5) {
             assert!(
-                !accept_peer_limited(lb_ip, TrustedProxy::Any),
-                "a trusted-any LB peer is never peer-rate-limited at accept"
+                !accept_peer_limited(lb_ip, &cloud_run),
+                "an internal Cloud Run proxy peer is exempt from the shared socket bucket"
             );
         }
 
         // Trust only a specific LB IP: that peer is exempt; everyone else is still limited.
         assert!(
-            !accept_peer_limited(lb_ip, TrustedProxy::Ip(lb_ip)),
+            !accept_peer_limited(lb_ip, &cloud_run),
             "the configured trusted LB IP is exempt from the accept-loop bucket"
         );
         let other: IpAddr = "203.0.113.99".parse().unwrap();
         assert!(
-            accept_peer_limited(other, TrustedProxy::Ip(lb_ip)),
+            accept_peer_limited(other, &cloud_run),
             "a non-trusted peer is still limited even when a specific LB IP is trusted"
         );
 
         // Direct exposure (no trusted proxy): the peer limiter still applies (the safe default).
         assert!(
-            accept_peer_limited(lb_ip, TrustedProxy::None),
+            accept_peer_limited(lb_ip, &TrustedProxy::None),
             "with no trusted proxy the accept-loop peer limiter stays on as the backstop"
         );
     }
@@ -1872,7 +2664,16 @@ mod tests {
         let head = read_request_head(&mut reader).expect("a normal head parses");
         assert!(head.method.eq_ignore_ascii_case("GET"));
         assert_eq!(head.raw_path, "/path");
-        assert_eq!(head.xff.as_deref(), Some("9.9.9.9"), "XFF still captured");
+        assert_eq!(head.xff, ForwardedFor::Value("9.9.9.9".into()));
+
+        let duplicate =
+            b"GET / HTTP/1.1\r\nX-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n\r\n";
+        let mut reader = BufReader::new(Cursor::new(duplicate).take(MAX_REQ_HEAD_BYTES));
+        assert_eq!(
+            read_request_head(&mut reader).unwrap().xff,
+            ForwardedFor::Invalid,
+            "duplicate forwarded headers are rejected rather than combined"
+        );
     }
 
     #[test]
@@ -1885,10 +2686,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let http = test_client();
+        let (event_tx, event_rx) = event_channel();
         let server = std::thread::spawn(move || {
+            let _event_rx = event_rx;
             let (sock, _) = listener.accept().unwrap();
             // Dead origin port: if the proxy ever fetched, it would 502, not 431.
-            serve_http_proxy(sock, "http://127.0.0.1:1", &http, 8 * 1024 * 1024);
+            serve_http_proxy(
+                sock,
+                &event_tx,
+                "http://127.0.0.1:1",
+                &http,
+                8 * 1024 * 1024,
+                TrustedProxy::None,
+            );
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -2077,6 +2887,25 @@ mod tests {
     }
 
     #[test]
+    fn cluster_replica_id_requires_a_bounded_operator_label() {
+        assert_eq!(
+            parse_cluster_replica_id(Some("replica-01")),
+            Ok("replica-01")
+        );
+        for invalid in [
+            None,
+            Some(""),
+            Some("contains space"),
+            Some("line\nbreak"),
+            Some("replica/slash"),
+        ] {
+            assert!(parse_cluster_replica_id(invalid).is_err());
+        }
+        let oversized = "a".repeat(MAX_CLUSTER_REPLICA_ID_BYTES + 1);
+        assert!(parse_cluster_replica_id(Some(&oversized)).is_err());
+    }
+
+    #[test]
     fn parse_args_no_relay_clears_the_relay_and_marks_cli_set() {
         // --no-relay runs the endpoint isolated (listening only); it must clear the default relay AND
         // record that the CLI decided, so env (HOP_RELAY/HOP_NO_RELAY) can't override the operator.
@@ -2129,11 +2958,15 @@ mod tests {
         r
     }
 
-    fn recv_fetched(rx: &mpsc::Receiver<Ev>) -> (u16, String, Vec<u8>) {
-        match rx
-            .recv_timeout(Duration::from_secs(4))
-            .expect("a reply was produced")
-        {
+    fn recv_fetched(rx: &EventRx) -> (u16, String, Vec<u8>) {
+        fetched(
+            rx.recv_timeout(Duration::from_secs(4))
+                .expect("a reply was produced"),
+        )
+    }
+
+    fn fetched(event: Ev) -> (u16, String, Vec<u8>) {
+        match event {
             Ev::Fetched(_to, _id, status, ctype, body) => (status, ctype, body),
             other => panic!("expected Ev::Fetched, got a different event: {other:?}"),
         }
@@ -2146,11 +2979,11 @@ mod tests {
         //   2. a request for our domain is fetched from the origin and the reply passed back,
         //   3. over the in-flight fetch cap the request is shed with 503 (no worker spawned).
         let http = test_client();
-        let (tx, rx) = mpsc::channel::<Ev>();
+        let (tx, rx) = event_channel();
         let domain = "example.hopme.sh";
 
         // 1. Wrong host -> 403, and the dead origin proves no backend fetch happened (no 502 hang).
-        handle_http_requests(
+        let immediate = handle_http_requests(
             vec![req_item_host("GET", "/x", "evil.example")],
             domain,
             "http://127.0.0.1:1",
@@ -2158,14 +2991,14 @@ mod tests {
             1024,
             &tx,
         );
-        let (status, ctype, body) = recv_fetched(&rx);
+        let (status, ctype, body) = fetched(immediate.into_iter().next().unwrap());
         assert_eq!(status, 403, "a non-authorized host is refused");
         assert!(ctype.starts_with("text/plain"));
         assert!(String::from_utf8_lossy(&body).contains("only serves example.hopme.sh"));
 
         // A trailing dot / different case on the request host still matches (normalized like --domain).
         let (origin, _o) = stub_origin(1, "200 OK", "text/plain; charset=utf-8", b"ok".to_vec());
-        handle_http_requests(
+        let immediate = handle_http_requests(
             vec![req_item_host("GET", "/y", "Example.HopMe.sh.")],
             domain,
             &origin,
@@ -2173,6 +3006,7 @@ mod tests {
             1024,
             &tx,
         );
+        assert!(immediate.is_empty());
         let (status, _ct, body) = recv_fetched(&rx);
         assert_eq!(
             status, 200,
@@ -2185,7 +3019,7 @@ mod tests {
         // 3. Over the in-flight cap: shed with 503 before spawning any worker. Simulate saturation by
         // pinning the counter at the cap, then restore it so the shared global isn't left dirty.
         INFLIGHT_FETCHES.fetch_add(MAX_INFLIGHT_FETCHES, Ordering::SeqCst);
-        handle_http_requests(
+        let immediate = handle_http_requests(
             vec![req_item("GET", "/z")], // host defaults to example.hopme.sh (matches)
             domain,
             "http://127.0.0.1:1", // dead: if a worker DID spawn this would be 502, not 503
@@ -2194,7 +3028,7 @@ mod tests {
             &tx,
         );
         INFLIGHT_FETCHES.fetch_sub(MAX_INFLIGHT_FETCHES, Ordering::SeqCst);
-        let (status, _ct, body) = recv_fetched(&rx);
+        let (status, _ct, body) = fetched(immediate.into_iter().next().unwrap());
         assert_eq!(
             status, 503,
             "over the fetch cap the request is shed, not queued"
@@ -2262,11 +3096,18 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let http = test_client();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            serve_conn(sock, &ev_tx, "http://127.0.0.1:1", &http, 1024);
+            serve_conn(
+                sock,
+                &ev_tx,
+                "http://127.0.0.1:1",
+                &http,
+                1024,
+                TrustedProxy::None,
+            );
         });
 
         let url = format!("ws://{addr}/");
@@ -2421,6 +3262,210 @@ mod tests {
     // ---- run: the driver event loop dispatches Up/Data/Down/Fetched and routes outgoing ---------
 
     #[test]
+    fn saturated_driver_queue_still_ticks_prunes_and_limits_each_batch() {
+        let identity = Identity::generate();
+        let destination = Identity::generate();
+        let expiring = Bundle::create(
+            &identity,
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"expire".to_vec(),
+            },
+            BundleOpts {
+                lifetime_ms: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expiring_id = expiring.id();
+        let mut node = Endpoint::new(Node::new(identity));
+        assert!(node.store.put(expiring, 0));
+
+        let (tx, rx) = event_channel();
+        for link in 0..MAX_EVENT_QUEUE_EVENTS / MAX_EVENT_SOURCE_EVENTS {
+            for _ in 0..MAX_EVENT_SOURCE_EVENTS {
+                tx.try_send(Ev::Data(link as u64, vec![link as u8]))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            tx.try_send(Ev::Data(100, vec![0])),
+            Err(QueueAdmissionError::QueueFull)
+        );
+        assert_eq!(tx.usage(), (MAX_EVENT_QUEUE_EVENTS, MAX_EVENT_QUEUE_EVENTS));
+
+        let mut writers = HashMap::new();
+        let mut next_tick = Instant::now();
+        let mut last_wk = Instant::now();
+        assert!(process_driver_events(
+            &mut node,
+            &mut writers,
+            &rx,
+            &mut next_tick,
+            &mut last_wk,
+            "wss://example.hopme.sh/",
+        ));
+        assert!(!node.store.contains(&expiring_id));
+        assert_eq!(
+            tx.usage().0,
+            MAX_EVENT_QUEUE_EVENTS - MAX_EVENT_BATCH,
+            "one loop iteration consumes only a bounded batch"
+        );
+    }
+
+    #[test]
+    fn continuously_replenished_driver_queue_keeps_tick_cadence_and_releases_capacity() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let identity = Identity::generate();
+        let destination = Identity::generate();
+        let mut node = Endpoint::new(Node::new(identity));
+        let wall_start = now_ms();
+        let mut expiring_ids = Vec::new();
+        for lifetime_ms in [500u32, 1_500, 2_500] {
+            let bundle = Bundle::create(
+                &Identity::generate(),
+                Destination::Device(destination.address()),
+                &destination.address(),
+                &Payload::PeerMessage {
+                    content_type: "text/plain".into(),
+                    body: lifetime_ms.to_be_bytes().to_vec(),
+                },
+                BundleOpts {
+                    lifetime_ms,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            expiring_ids.push(bundle.id());
+            assert!(node.store.put(bundle, wall_start));
+        }
+
+        let (tx, rx) = event_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicU64::new(0));
+        let producer_stop = stop.clone();
+        let producer_accepted = accepted.clone();
+        let producer_tx = tx.clone();
+        let producer = std::thread::spawn(move || {
+            let sources = MAX_EVENT_QUEUE_EVENTS / MAX_EVENT_SOURCE_EVENTS;
+            let mut sequence = 0usize;
+            while !producer_stop.load(Ordering::Acquire) {
+                let link = (sequence % sources) as u64;
+                match producer_tx.try_send(Ev::Data(link, vec![sequence as u8; 1024])) {
+                    Ok(()) => {
+                        producer_accepted.fetch_add(1, Ordering::AcqRel);
+                        sequence = sequence.wrapping_add(1);
+                    }
+                    Err(QueueAdmissionError::QueueFull | QueueAdmissionError::SourceFull) => {
+                        std::thread::yield_now();
+                    }
+                    Err(QueueAdmissionError::Disconnected) => break,
+                    Err(error) => panic!("unexpected producer admission error: {error:?}"),
+                }
+            }
+        });
+
+        let fill_deadline = Instant::now() + Duration::from_secs(1);
+        while tx.usage().0 <= MAX_EVENT_BATCH && Instant::now() < fill_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            tx.usage().0 > MAX_EVENT_BATCH,
+            "the live producer established a replenished backlog"
+        );
+
+        let mut writers = HashMap::new();
+        let mut next_tick = Instant::now() + DRIVER_TICK_INTERVAL;
+        let mut prior_deadline = next_tick;
+        let mut last_wk = Instant::now();
+        let mut ticks = 0usize;
+        let mut accepted_at_prior_tick = accepted.load(Ordering::Acquire);
+        let mut maximum_usage = (0usize, 0usize);
+
+        while ticks < expiring_ids.len() {
+            assert!(process_driver_events(
+                &mut node,
+                &mut writers,
+                &rx,
+                &mut next_tick,
+                &mut last_wk,
+                "wss://example.hopme.sh/",
+            ));
+            let usage = tx.usage();
+            maximum_usage.0 = maximum_usage.0.max(usage.0);
+            maximum_usage.1 = maximum_usage.1.max(usage.1);
+            assert!(usage.0 <= MAX_EVENT_QUEUE_EVENTS);
+            assert!(usage.1 <= MAX_EVENT_QUEUE_BYTES);
+
+            if next_tick > prior_deadline {
+                assert_eq!(
+                    next_tick,
+                    prior_deadline + DRIVER_TICK_INTERVAL,
+                    "bounded event batches must not skip a monotonic tick deadline"
+                );
+                let accepted_now = accepted.load(Ordering::Acquire);
+                assert!(
+                    accepted_now > accepted_at_prior_tick,
+                    "the producer replenished the queue across tick {}",
+                    ticks + 1
+                );
+                accepted_at_prior_tick = accepted_now;
+                ticks += 1;
+                prior_deadline = next_tick;
+                for id in &expiring_ids[..ticks] {
+                    assert!(!node.store.contains(id), "tick {ticks} pruned its deadline");
+                }
+                for id in &expiring_ids[ticks..] {
+                    assert!(node.store.contains(id), "later deadlines remain queued");
+                }
+            }
+            std::thread::yield_now();
+        }
+
+        stop.store(true, Ordering::Release);
+        producer.join().unwrap();
+        let accepted_after_stop = accepted.load(Ordering::Acquire);
+        while tx.usage().0 != 0 {
+            assert!(process_driver_events(
+                &mut node,
+                &mut writers,
+                &rx,
+                &mut next_tick,
+                &mut last_wk,
+                "wss://example.hopme.sh/",
+            ));
+            let usage = tx.usage();
+            assert!(usage.0 <= MAX_EVENT_QUEUE_EVENTS);
+            assert!(usage.1 <= MAX_EVENT_QUEUE_BYTES);
+        }
+        assert_eq!(
+            tx.usage(),
+            (0, 0),
+            "draining releases all count and byte capacity"
+        );
+        assert_eq!(accepted.load(Ordering::Acquire), accepted_after_stop);
+        assert!(maximum_usage.0 > MAX_EVENT_BATCH);
+        assert!(maximum_usage.1 >= maximum_usage.0.saturating_mul(1024));
+
+        drop(tx);
+        assert!(
+            !process_driver_events(
+                &mut node,
+                &mut writers,
+                &rx,
+                &mut next_tick,
+                &mut last_wk,
+                "wss://example.hopme.sh/",
+            ),
+            "the driver exits cleanly after the producer stops and the queue drains"
+        );
+    }
+
+    #[test]
     fn run_driver_dispatches_events_and_routes_outgoing_to_the_link_writer() {
         // Drive the real driver loop: an Ev::Up(Initiator) registers a writer AND makes the node emit
         // its Noise handshake msg1, which the driver must route back to that link's writer (out_rx).
@@ -2429,7 +3474,7 @@ mod tests {
         // we assert the observable msg1 routing, then let the daemon thread go (it can't be stopped from
         // outside by design, mirroring the always-on production loop).
         let node = Endpoint::new(Node::new(Identity::generate()));
-        let (tx, rx) = mpsc::channel::<Ev>();
+        let (tx, rx) = event_channel();
         let driver_tx = tx.clone();
         let http = test_client();
         std::thread::spawn(move || {
@@ -2445,7 +3490,7 @@ mod tests {
         });
 
         // Ev::Up as the Initiator: the node produces handshake msg1, which the driver routes to out_rx.
-        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
         tx.send(Ev::Up(1, Role::Initiator, out_tx)).unwrap();
         let msg1 = out_rx
             .recv_timeout(Duration::from_secs(3))
@@ -2511,7 +3556,7 @@ mod tests {
         });
 
         let url = format!("ws://{addr}/");
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         // dial_relay reconnects forever; run it detached and just observe the first connection's events.
         std::thread::spawn(move || dial_relay(url, ev_tx));
 
@@ -2556,7 +3601,7 @@ mod tests {
         // branch (log + reconnect_backoff sleep) and no Ev::Up ever arrives. We observe the absence of a
         // link within a short window; the dialer then sleeps in backoff (detached, mirroring production
         // where the endpoint keeps serving its origin while mesh reachability is down).
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         std::thread::spawn(move || dial_relay("ws://127.0.0.1:1/".to_string(), ev_tx));
         // Nothing should come up: the relay is refused, so the error branch runs and backs off.
         assert!(
@@ -2623,7 +3668,7 @@ mod tests {
         let head = read_request_head(&mut reader).expect("complete lines are served on EOF");
         assert!(head.method.eq_ignore_ascii_case("GET"));
         assert_eq!(head.raw_path, "/page");
-        assert!(head.xff.is_none(), "no X-Forwarded-For present");
+        assert_eq!(head.xff, ForwardedFor::Absent);
     }
 
     /// A reader that emits its buffered bytes once, then fails every subsequent read. Wrapped in a
@@ -2718,18 +3763,14 @@ mod tests {
     fn spawn_serve_conn(
         origin: &'static str,
         max_resp: u32,
-    ) -> (
-        std::net::SocketAddr,
-        mpsc::Receiver<Ev>,
-        std::thread::JoinHandle<()>,
-    ) {
+    ) -> (std::net::SocketAddr, EventRx, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let http = test_client();
         let h = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            serve_conn(sock, &ev_tx, origin, &http, max_resp);
+            serve_conn(sock, &ev_tx, origin, &http, max_resp, TrustedProxy::None);
         });
         (addr, ev_rx, h)
     }
@@ -2973,8 +4014,7 @@ mod tests {
 
     #[test]
     fn read_request_head_captures_x_forwarded_for() {
-        // The X-Forwarded-For header is captured (keyed on the trusted last hop) for the per-client
-        // rate limit; other headers are drained and ignored.
+        // Preserve the complete chain so topology validation can select relative to its trusted suffix.
         use std::io::Cursor;
         let raw =
             b"GET /p HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 1.1.1.1, 2.2.2.2\r\nAccept: */*\r\n\r\n"
@@ -2982,10 +4022,6 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(raw).take(MAX_REQ_HEAD_BYTES));
         let head = read_request_head(&mut reader).expect("a well-formed head parses");
         assert_eq!(head.raw_path, "/p");
-        assert_eq!(
-            head.xff.as_deref(),
-            Some("2.2.2.2"),
-            "the last (trusted) XFF hop is captured"
-        );
+        assert_eq!(head.xff, ForwardedFor::Value("1.1.1.1, 2.2.2.2".into()));
     }
 }
