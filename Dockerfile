@@ -1,4 +1,4 @@
-# Container image for example.hopme.sh — a `hops://` demo (DESIGN.md §30).
+# Container image for example.hopme.sh, a `hops://` demo (DESIGN.md §30).
 #
 # It bundles two binaries and runs both:
 #   - hop-example-origin : a tiny HTTP backend on localhost:8080 (the "origin")

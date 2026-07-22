@@ -31,13 +31,13 @@ version.workspace = true
 edition.workspace = true
 license-file = "LICENSE.md"
 repository.workspace = true
-description = "hops:// origin endpoint — a listening Hop node that translates hops requests to its OWN HTTP backend (DESIGN.md §30). Operator-run; bound to one domain; never an open proxy."
+description = "hops:// origin endpoint, a listening Hop node that translates hops requests to its OWN HTTP backend (DESIGN.md §30). Operator-run; bound to one domain; never an open proxy."
 
 [dependencies]
 hop-core.workspace = true
 hop-endpoint-core.workspace = true
 # services-r3-03: reuse the ONE shared, tested relay-degrade precedence (resolve_relay) so the
-# gateway and endpoint cannot drift. Default (lib-only) features — no reqwest/tungstenite pulled in.
+# gateway and endpoint cannot drift. Default (lib-only) features, no reqwest/tungstenite pulled in.
 hop-gateway = { path = "../hop-gateway", version = "0.0.1" }
 # rustls feature so the endpoint can DIAL a relay over wss:// (be routable on the mesh, §30).
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
