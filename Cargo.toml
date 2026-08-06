@@ -45,4 +45,4 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 bs58 = "0.5"
 # Base64 (std alphabet) for the `reach` field of the /.well-known/hop body, matching every endpoint
 # SDK's discovery format so the drivers decode it identically (DESIGN.md §30).
-base64 = "0.22"
+base64 = "0.23"
